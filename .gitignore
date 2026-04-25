@@ -1,0 +1,16 @@
+# Build artifacts
+/build/
+/build-*/
+compile_commands.json
+
+# Editor / IDE
+/.vscode/
+/.idea/
+/.vs/
+
+# Runtime artifacts
+*.mcap
+*.log
+
+# OS
+.DS_Store
