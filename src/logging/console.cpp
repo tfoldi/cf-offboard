@@ -1,11 +1,32 @@
 #include "logging/console.hpp"
 
+#include "ui/types.hpp"
+
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
+#include <string>
 #include <unistd.h>
+
+namespace cfo::console {
+
+namespace {
+std::atomic<cfo::EventLog*> g_event_log{nullptr};
+std::atomic<bool>           g_stderr_silent{false};
+}
+
+void set_event_log(cfo::EventLog* log) {
+    g_event_log.store(log, std::memory_order_release);
+}
+
+void set_stderr_silent(bool silent) {
+    g_stderr_silent.store(silent, std::memory_order_release);
+}
+
+} // namespace cfo::console
 
 namespace cfo::console::detail {
 
@@ -48,6 +69,24 @@ constexpr const char* kReset = "\033[0m";
 void emit(Level level, std::string_view formatted) {
     using namespace std::chrono;
     const auto now = system_clock::now();
+
+    // Mirror to event log if configured (TUI consumes from there).
+    if (auto* log = ::cfo::console::g_event_log.load(std::memory_order_acquire)) {
+        ::cfo::LogEntry e{};
+        switch (level) {
+            case Level::Info:  e.level = ::cfo::LogEntry::Level::Info;  break;
+            case Level::Warn:  e.level = ::cfo::LogEntry::Level::Warn;  break;
+            case Level::Error: e.level = ::cfo::LogEntry::Level::Error; break;
+        }
+        e.t = now;
+        e.text.assign(formatted.data(), formatted.size());
+        log->push(std::move(e));
+    }
+
+    if (::cfo::console::g_stderr_silent.load(std::memory_order_acquire)) {
+        return;
+    }
+
     const auto t = system_clock::to_time_t(now);
     const auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
 

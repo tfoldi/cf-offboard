@@ -151,6 +151,19 @@ target_include_directories(cfo_mission PUBLIC ${_cfo_src})
 target_link_libraries(cfo_mission PUBLIC cfo_state cfo_safety)
 
 # ----------------------------------------------------------------------------
+# UI — hand-rolled ANSI terminal frontend. Observer of state, source of
+# typed operator intents (no protocol awareness). Runs on its own thread.
+# ----------------------------------------------------------------------------
+
+add_library(cfo_ui STATIC
+    src/ui/tui.cpp
+)
+target_include_directories(cfo_ui PUBLIC ${_cfo_src})
+target_link_libraries(cfo_ui
+    PUBLIC  cfo_state cfo_mission cfo_safety
+    PRIVATE Threads::Threads)
+
+# ----------------------------------------------------------------------------
 # Logging — MCAP-backed async logger. mcap_headers is PRIVATE so MCAP types
 # do not leak through cfo_logging's public surface. LogEvent references
 # types from cfo_link / cfo_safety / cfo_state, hence those are PUBLIC.
@@ -164,6 +177,9 @@ target_include_directories(cfo_logging PUBLIC ${_cfo_src})
 target_link_libraries(cfo_logging
     PUBLIC  cfo_link cfo_safety cfo_state cfo_mission
     PRIVATE mcap_headers Threads::Threads)
+# cfo_logging includes <ui/types.hpp> for EventLog, but those are header-only
+# value types — no link-time symbols needed. Include path is already covered
+# by the `_cfo_src` PUBLIC directory above.
 
 # ----------------------------------------------------------------------------
 # Control loop — fixed-rate setpoint streamer for slice (a)'s hover demo.
@@ -186,7 +202,7 @@ target_link_libraries(cfo_control
 add_executable(cf-offboard src/app/main.cpp)
 target_link_libraries(cf-offboard PRIVATE
     cfo_link cfo_log cfo_logging cfo_state cfo_control cfo_safety cfo_mission
-    Threads::Threads)
+    cfo_ui Threads::Threads)
 
 # ----------------------------------------------------------------------------
 # Offline tools — debugging and analysis utilities. Self-contained; do not

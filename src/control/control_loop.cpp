@@ -42,7 +42,8 @@ void run_control_loop(ICrazyflieLink& link,
                       const StateStore& state,
                       MCAPLogger& logger,
                       const ControlLoopConfig& cfg,
-                      std::atomic<bool>& shutdown_requested) {
+                      std::atomic<bool>& shutdown_requested,
+                      MissionStateCallback on_state_change) {
     using clock = std::chrono::steady_clock;
 
     MissionContext ctx{};
@@ -71,6 +72,9 @@ void run_control_loop(ICrazyflieLink& link,
             cfo::console::info("mission: → {}", state_name(ctx.state));
             logger.log(MissionStateEvent{
                 ctx.state, ctx.abort_reason, ctx.abort_detail, t_host});
+            if (on_state_change) {
+                on_state_change(ctx.state, ctx.abort_reason);
+            }
         }
 
         const auto pkt = to_packet(out.command);
@@ -83,7 +87,10 @@ void run_control_loop(ICrazyflieLink& link,
         if (out.terminate) {
             cfo::console::info("control: loop exiting ({})",
                                state_name(ctx.state));
-            shutdown_requested.store(true, std::memory_order_release);
+            // Don't touch shutdown_requested — that's an *app-level* signal
+            // owned by main.cpp. The control loop just returns; main decides
+            // whether to wind everything down (headless) or wait for the
+            // operator to quit (TUI).
             return;
         }
 

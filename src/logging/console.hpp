@@ -15,7 +15,17 @@
 #include <string_view>
 #include <utility>
 
+namespace cfo {
+class EventLog;  // src/ui/types.hpp
+}
+
 namespace cfo::console {
+
+// Configure runtime sinks. By default emit() writes to stderr only. The
+// app may additionally feed an EventLog (so the TUI shows console lines)
+// and/or silence stderr when the TUI owns the screen.
+void set_event_log(cfo::EventLog* log);
+void set_stderr_silent(bool silent);
 
 namespace detail {
 
