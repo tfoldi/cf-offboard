@@ -132,8 +132,28 @@ target_include_directories(cfo_log PUBLIC ${_cfo_src})
 target_link_libraries(cfo_log PUBLIC cfo_link cfo_state)
 
 # ----------------------------------------------------------------------------
+# Safety — pure header-only supervisor (check_safety + types).
+# ----------------------------------------------------------------------------
+
+add_library(cfo_safety INTERFACE)
+target_include_directories(cfo_safety INTERFACE ${_cfo_src})
+target_link_libraries(cfo_safety INTERFACE cfo_state)
+
+# ----------------------------------------------------------------------------
+# Mission state machine — pure tick function, no IO. Drives the control
+# loop's per-tick MissionCommand output.
+# ----------------------------------------------------------------------------
+
+add_library(cfo_mission STATIC
+    src/mission/mission.cpp
+)
+target_include_directories(cfo_mission PUBLIC ${_cfo_src})
+target_link_libraries(cfo_mission PUBLIC cfo_state cfo_safety)
+
+# ----------------------------------------------------------------------------
 # Logging — MCAP-backed async logger. mcap_headers is PRIVATE so MCAP types
-# do not leak through cfo_logging's public surface.
+# do not leak through cfo_logging's public surface. LogEvent references
+# types from cfo_link / cfo_safety / cfo_state, hence those are PUBLIC.
 # ----------------------------------------------------------------------------
 
 add_library(cfo_logging STATIC
@@ -142,8 +162,22 @@ add_library(cfo_logging STATIC
 )
 target_include_directories(cfo_logging PUBLIC ${_cfo_src})
 target_link_libraries(cfo_logging
-    PUBLIC  cfo_link            # for RawPacket / protocol types
+    PUBLIC  cfo_link cfo_safety cfo_state cfo_mission
     PRIVATE mcap_headers Threads::Threads)
+
+# ----------------------------------------------------------------------------
+# Control loop — fixed-rate setpoint streamer for slice (a)'s hover demo.
+# Depends on cfo_logging because control_loop.hpp signatures reference
+# MCAPLogger and the loop body emits SetpointCommandEvent / SafetyEvent.
+# ----------------------------------------------------------------------------
+
+add_library(cfo_control STATIC
+    src/control/control_loop.cpp
+)
+target_include_directories(cfo_control PUBLIC ${_cfo_src})
+target_link_libraries(cfo_control
+    PUBLIC  cfo_link cfo_state cfo_safety cfo_mission cfo_logging
+    PRIVATE Threads::Threads)
 
 # ----------------------------------------------------------------------------
 # Application — startup, RX thread, graceful shutdown.
@@ -151,7 +185,8 @@ target_link_libraries(cfo_logging
 
 add_executable(cf-offboard src/app/main.cpp)
 target_link_libraries(cf-offboard PRIVATE
-    cfo_link cfo_log cfo_logging cfo_state Threads::Threads)
+    cfo_link cfo_log cfo_logging cfo_state cfo_control cfo_safety cfo_mission
+    Threads::Threads)
 
 # ----------------------------------------------------------------------------
 # Offline tools — debugging and analysis utilities. Self-contained; do not
@@ -180,7 +215,11 @@ add_executable(cfo_tests
     tests/test_protocol.cpp
     tests/test_log_protocol.cpp
     tests/test_state.cpp
+    tests/test_setpoint.cpp
+    tests/test_safety.cpp
+    tests/test_mission.cpp
 )
 target_include_directories(cfo_tests PRIVATE ${_cfo_src})
-target_link_libraries(cfo_tests PRIVATE cfo_link cfo_log cfo_state doctest_headers)
+target_link_libraries(cfo_tests PRIVATE
+    cfo_link cfo_log cfo_state cfo_safety cfo_mission cfo_control doctest_headers)
 add_test(NAME cfo_tests COMMAND cfo_tests)

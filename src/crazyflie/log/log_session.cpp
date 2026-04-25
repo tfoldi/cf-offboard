@@ -247,4 +247,33 @@ setup_log_block(ICrazyflieLink& link,
     return resolved;
 }
 
+std::expected<SupervisorState, LogSetupFailure>
+query_supervisor_state(ICrazyflieLink& link,
+                       std::function<void(const RawPacket&)> passthrough,
+                       std::chrono::milliseconds timeout) {
+    if (auto r = link.send(make_supervisor_info_request()); !r) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::SendFailed, "send supervisor info"});
+    }
+    const auto deadline = clock::now() + timeout;
+    const std::uint8_t expected_cmd =
+        crtp::kCmdSupervisorGetStateBitfield | crtp::kCmdResponseFlag;
+    auto reply = wait_for(link, passthrough, deadline,
+        "awaiting supervisor info",
+        [expected_cmd](const RawPacket& p) {
+            return p.port == crtp::kPortSupervisor &&
+                   p.channel == crtp::kChannelSupervisorInfo &&
+                   p.size >= 1 &&
+                   p.payload[0] == expected_cmd;
+        });
+    if (!reply) return std::unexpected(reply.error());
+    auto state = decode_supervisor_state(*reply);
+    if (!state) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::TocItemFailed,
+            "decode supervisor state"});
+    }
+    return *state;
+}
+
 } // namespace cfo

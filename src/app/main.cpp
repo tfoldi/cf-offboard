@@ -1,4 +1,6 @@
 #include "app/config.hpp"
+#include "control/control_loop.hpp"
+#include "control/types.hpp"
 #include "crazyflie/link/interfaces.hpp"
 #include "crazyflie/link/types.hpp"
 #include "crazyflie/log/log_session.hpp"
@@ -148,6 +150,66 @@ int main(int argc, char** argv) {
     }
     cfo::console::info("LOG: setup complete — telemetry active");
 
+    // Pre-RX supervisor sanity check. Done here, while we still own the
+    // receive line, so query_supervisor_state doesn't race with the RX
+    // thread for the reply packet. If the firmware reports locked/crashed
+    // (typical after a controlled landing on the previous run), send a
+    // recover command and re-query before giving up.
+    {
+        auto raw_passthrough = [&](const cfo::RawPacket& p) {
+            const auto t = std::chrono::system_clock::now();
+            logger.log(cfo::RawTelemetryEvent{p, t});
+        };
+
+        auto report = [&](const cfo::SupervisorState& s, const char* label) {
+            cfo::console::info(
+                "supervisor: {} — armed={} can_arm={} can_fly={} "
+                "tumbled={} locked={} crashed={}",
+                label, s.is_armed, s.can_be_armed, s.can_fly,
+                s.is_tumbled, s.is_locked, s.is_crashed);
+        };
+
+        auto sup_r = cfo::query_supervisor_state(link, raw_passthrough);
+        if (sup_r) {
+            logger.log(cfo::SupervisorStateEvent{
+                *sup_r, std::chrono::system_clock::now()});
+            report(*sup_r, "pre-arm");
+
+            if (sup_r->is_locked || sup_r->is_crashed) {
+                cfo::console::warn(
+                    "supervisor: locked/crashed — sending CMD_RECOVER_SYSTEM");
+                const auto rec_pkt = cfo::make_supervisor_recover();
+                const auto t_rec = std::chrono::system_clock::now();
+                if (auto r = link.send(rec_pkt); r) {
+                    logger.log(cfo::RawCommandEvent{rec_pkt, t_rec});
+                } else {
+                    cfo::console::warn("supervisor: recover send failed");
+                }
+
+                // Re-query to confirm. Firmware usually clears within ~10ms.
+                auto sup2_r = cfo::query_supervisor_state(link, raw_passthrough);
+                if (sup2_r) {
+                    logger.log(cfo::SupervisorStateEvent{
+                        *sup2_r, std::chrono::system_clock::now()});
+                    report(*sup2_r, "post-recover");
+                    if (sup2_r->is_locked || sup2_r->is_crashed) {
+                        cfo::console::error(
+                            "supervisor: still locked after recover — aborting flight");
+                        g_shutdown.store(true, std::memory_order_release);
+                    }
+                } else {
+                    cfo::console::warn(
+                        "supervisor: post-recover query failed ({}) — proceeding",
+                        sup2_r.error().detail);
+                }
+            }
+        } else {
+            cfo::console::warn(
+                "supervisor: pre-arm query failed ({}) — proceeding",
+                sup_r.error().detail);
+        }
+    }
+
     cfo::StateStore state;
     std::atomic<bool> first_sample_seen{false};
 
@@ -230,6 +292,70 @@ int main(int argc, char** argv) {
     }
 
     cfo::console::info("running — Ctrl-C to stop");
+
+    // Spawn the control loop only after we've seen at least one telemetry
+    // sample. If the watchdog fired we abort the flight slice; the operator
+    // can keep the run going to inspect logs.
+    std::thread control_thread;
+    bool armed = false;
+    if (first_sample_seen.load(std::memory_order_acquire) &&
+        !g_shutdown.load(std::memory_order_relaxed)) {
+        // Arm the firmware's supervisor. setpoint_stop disarms at end-of-run,
+        // so a second consecutive flight is silently ignored without re-arm.
+        // Send both modern (SUPERVISOR/v12+) and legacy (PLATFORM) packets —
+        // whichever the firmware doesn't recognize is silently dropped.
+        const auto t_arm = std::chrono::system_clock::now();
+        const auto arm_modern = cfo::make_arm_request(true);
+        const auto arm_legacy = cfo::make_arm_request_legacy(true);
+        const bool ok_modern = static_cast<bool>(link.send(arm_modern));
+        const bool ok_legacy = static_cast<bool>(link.send(arm_legacy));
+        if (ok_modern || ok_legacy) {
+            if (ok_modern) logger.log(cfo::RawCommandEvent{arm_modern, t_arm});
+            if (ok_legacy) logger.log(cfo::RawCommandEvent{arm_legacy, t_arm});
+            cfo::console::info("supervisor: arm requested (modern={}, legacy={})",
+                               ok_modern, ok_legacy);
+            armed = true;
+        } else {
+            cfo::console::error("supervisor: arm send failed — aborting flight");
+            g_shutdown.store(true, std::memory_order_release);
+        }
+
+        if (armed) {
+            cfo::ControlLoopConfig ctrl_cfg{};
+            const auto& m = ctrl_cfg.mission;
+            cfo::console::info(
+                "mission: takeoff {:.2f}m, fwd {:.2f}m/s "
+                "(takeoff {}ms / hover {}ms / fwd {}ms / preland {}ms / land {}ms)",
+                m.target_height_m, m.forward_velocity_mps,
+                m.takeoff_duration.count(), m.hover_duration.count(),
+                m.forward_duration.count(), m.preland_hover_duration.count(),
+                m.land_duration.count());
+            control_thread = std::thread{[&] {
+                cfo::run_control_loop(link, state, logger, ctrl_cfg, g_shutdown);
+            }};
+        }
+    } else {
+        cfo::console::warn("control: not started (no telemetry seen)");
+    }
+
+    if (control_thread.joinable()) control_thread.join();
+
+    // Explicit disarm. setpoint_stop already disarms the motors; we send
+    // disarm here to make the supervisor state explicit and symmetric with
+    // the arm above. Both flavors again, for the same reason.
+    if (armed) {
+        const auto t_disarm = std::chrono::system_clock::now();
+        const auto disarm_modern = cfo::make_arm_request(false);
+        const auto disarm_legacy = cfo::make_arm_request_legacy(false);
+        if (auto r = link.send(disarm_modern); r) {
+            logger.log(cfo::RawCommandEvent{disarm_modern, t_disarm});
+        }
+        if (auto r = link.send(disarm_legacy); r) {
+            logger.log(cfo::RawCommandEvent{disarm_legacy, t_disarm});
+        }
+        cfo::console::info("supervisor: disarm requested");
+    }
+
     rx_thread.join();
 
     logger.log(make_link_event(cfo::LinkState::Closed, cfg.crazyflie_uri));

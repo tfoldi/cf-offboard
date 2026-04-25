@@ -2,6 +2,8 @@
 
 #include "crazyflie/link/types.hpp"
 #include "crazyflie/protocol/types.hpp"
+#include "mission/types.hpp"
+#include "safety/types.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -54,13 +56,54 @@ struct LogBlockEvent {
     std::chrono::system_clock::time_point t;  // host receive time
 };
 
-// Closed set of events the logger knows how to write. Extended per slice as
-// new event categories are added (state snapshots, safety decisions, ...).
+// Decoded outbound setpoint produced by the control loop. Mirrors the raw
+// bytes (also logged) so analysis tools don't need to re-decode.
+struct SetpointCommandEvent {
+    enum class Kind : std::uint8_t { Stop, Hover };
+    Kind  kind;
+    float vx_mps;            // Hover only
+    float vy_mps;            // Hover only
+    float yaw_rate_dps;      // Hover only
+    float z_target_m;        // Hover only
+    std::chrono::system_clock::time_point t;
+};
+
+// Safety supervisor decision — emitted whenever the supervisor moves into
+// an aborted state, so the abort is auditable in MCAP.
+struct SafetyEvent {
+    AbortReason reason;
+    std::string detail;
+    std::chrono::system_clock::time_point t;
+};
+
+// Snapshot of the firmware's supervisor state bitfield, captured during the
+// pre-arm sanity check (and any future post-arm verification).
+struct SupervisorStateEvent {
+    SupervisorState state;
+    std::chrono::system_clock::time_point t;
+};
+
+// Mission state machine transition. Emitted whenever mission_tick reports
+// a state change. abort_reason/detail are populated only when entering
+// MissionState::Aborted.
+struct MissionStateEvent {
+    MissionState state;
+    AbortReason  abort_reason{AbortReason::None};
+    std::string  abort_detail;
+    std::chrono::system_clock::time_point t;
+};
+
+// Closed set of events the logger knows how to write. Extended per slice
+// as new event categories are added.
 using LogEvent = std::variant<
     LinkEvent,
     RawTelemetryEvent,
     RawCommandEvent,
     ConsoleEvent,
-    LogBlockEvent>;
+    LogBlockEvent,
+    SetpointCommandEvent,
+    SafetyEvent,
+    SupervisorStateEvent,
+    MissionStateEvent>;
 
 } // namespace cfo

@@ -91,6 +91,14 @@ setup_log_block(ICrazyflieLink& link,
                 LogSetupNotifier on_progress = nullptr,
                 std::chrono::milliseconds total_timeout = std::chrono::seconds{5});
 
+// One-shot supervisor state query. Sends CMD_GET_STATE_BITFIELD on the
+// info channel and returns the decoded SupervisorState. Same threading
+// constraint as setup_log_block — caller must own the receive line.
+std::expected<SupervisorState, LogSetupFailure>
+query_supervisor_state(ICrazyflieLink& link,
+                       std::function<void(const RawPacket&)> passthrough,
+                       std::chrono::milliseconds timeout = std::chrono::milliseconds{500});
+
 // ---------------------------------------------------------------------------
 // LogBlockSample → Telemetry adapters. Pure functions; tested directly.
 // Stabilizer angles arrive in degrees; VehicleState::Attitude is in radians.

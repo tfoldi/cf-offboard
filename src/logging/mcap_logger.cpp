@@ -108,6 +108,53 @@ constexpr std::string_view kStateSchema = R"({
   "required":["fw_t_ms","x","y","z","vbat","roll","pitch","yaw"]
 })";
 
+constexpr std::string_view kSetpointSchema = R"({
+  "type":"object",
+  "properties":{
+    "kind":{"type":"string","enum":["stop","hover"]},
+    "vx":{"type":"number"},"vy":{"type":"number"},
+    "yaw_rate_dps":{"type":"number"},
+    "z_target_m":{"type":"number"}
+  },
+  "required":["kind"]
+})";
+
+constexpr std::string_view kSafetySchema = R"({
+  "type":"object",
+  "properties":{
+    "reason":{"type":"string"},
+    "detail":{"type":"string"}
+  },
+  "required":["reason"]
+})";
+
+constexpr std::string_view kMissionSchema = R"({
+  "type":"object",
+  "properties":{
+    "state":{"type":"string"},
+    "abort_reason":{"type":"string"},
+    "abort_detail":{"type":"string"}
+  },
+  "required":["state"]
+})";
+
+constexpr std::string_view kSupervisorSchema = R"({
+  "type":"object",
+  "properties":{
+    "can_be_armed":{"type":"boolean"},
+    "is_armed":{"type":"boolean"},
+    "is_auto_armed":{"type":"boolean"},
+    "can_fly":{"type":"boolean"},
+    "is_flying":{"type":"boolean"},
+    "is_tumbled":{"type":"boolean"},
+    "is_locked":{"type":"boolean"},
+    "is_crashed":{"type":"boolean"},
+    "hl_control_active":{"type":"boolean"},
+    "hl_traj_finished":{"type":"boolean"},
+    "hl_control_disabled":{"type":"boolean"}
+  }
+})";
+
 } // namespace
 
 struct MCAPLogger::Impl {
@@ -130,11 +177,19 @@ struct MCAPLogger::Impl {
     mcap::ChannelId cmd_channel_id{0};
     mcap::ChannelId console_channel_id{0};
     mcap::ChannelId state_channel_id{0};
+    mcap::ChannelId setpoint_channel_id{0};
+    mcap::ChannelId safety_channel_id{0};
+    mcap::ChannelId supervisor_channel_id{0};
+    mcap::ChannelId mission_channel_id{0};
     std::uint32_t link_seq{0};
     std::uint32_t raw_seq{0};
     std::uint32_t cmd_seq{0};
     std::uint32_t console_seq{0};
     std::uint32_t state_seq{0};
+    std::uint32_t setpoint_seq{0};
+    std::uint32_t safety_seq{0};
+    std::uint32_t supervisor_seq{0};
+    std::uint32_t mission_seq{0};
 
     std::thread thread;
 
@@ -195,6 +250,88 @@ struct MCAPLogger::Impl {
             s.x, s.y, s.z, s.vbat, s.roll, s.pitch, s.yaw);
         emit(state_channel_id, ++state_seq, e.t,
              std::string{buf, static_cast<std::size_t>(n)});
+    }
+
+    void write_event(const SetpointCommandEvent& e) {
+        char buf[160];
+        int n;
+        if (e.kind == SetpointCommandEvent::Kind::Stop) {
+            n = std::snprintf(buf, sizeof(buf), R"({"kind":"stop"})");
+        } else {
+            n = std::snprintf(
+                buf, sizeof(buf),
+                R"({"kind":"hover","vx":%.4f,"vy":%.4f,)"
+                R"("yaw_rate_dps":%.4f,"z_target_m":%.4f})",
+                e.vx_mps, e.vy_mps, e.yaw_rate_dps, e.z_target_m);
+        }
+        emit(setpoint_channel_id, ++setpoint_seq, e.t,
+             std::string{buf, static_cast<std::size_t>(n)});
+    }
+
+    void write_event(const MissionStateEvent& e) {
+        const char* reason = "none";
+        switch (e.abort_reason) {
+            case AbortReason::None:           reason = "none"; break;
+            case AbortReason::TelemetryStale: reason = "telemetry_stale"; break;
+            case AbortReason::LowBattery:     reason = "low_battery"; break;
+            case AbortReason::LinkLost:       reason = "link_lost"; break;
+            case AbortReason::OperatorAbort:  reason = "operator_abort"; break;
+            case AbortReason::MissionTimeout: reason = "mission_timeout"; break;
+        }
+        std::string payload;
+        payload.reserve(64 + e.abort_detail.size());
+        payload += R"({"state":")";
+        payload += state_name(e.state);
+        payload += R"(","abort_reason":")";
+        payload += reason;
+        payload += R"(","abort_detail":")";
+        json_escape_into(payload, e.abort_detail);
+        payload += R"("})";
+        emit(mission_channel_id, ++mission_seq, e.t, payload);
+    }
+
+    void write_event(const SupervisorStateEvent& e) {
+        char buf[300];
+        const auto& s = e.state;
+        const int n = std::snprintf(
+            buf, sizeof(buf),
+            R"({"can_be_armed":%s,"is_armed":%s,"is_auto_armed":%s,)"
+            R"("can_fly":%s,"is_flying":%s,"is_tumbled":%s,)"
+            R"("is_locked":%s,"is_crashed":%s,"hl_control_active":%s,)"
+            R"("hl_traj_finished":%s,"hl_control_disabled":%s})",
+            s.can_be_armed ? "true" : "false",
+            s.is_armed ? "true" : "false",
+            s.is_auto_armed ? "true" : "false",
+            s.can_fly ? "true" : "false",
+            s.is_flying ? "true" : "false",
+            s.is_tumbled ? "true" : "false",
+            s.is_locked ? "true" : "false",
+            s.is_crashed ? "true" : "false",
+            s.hl_control_active ? "true" : "false",
+            s.hl_traj_finished ? "true" : "false",
+            s.hl_control_disabled ? "true" : "false");
+        emit(supervisor_channel_id, ++supervisor_seq, e.t,
+             std::string{buf, static_cast<std::size_t>(n)});
+    }
+
+    void write_event(const SafetyEvent& e) {
+        const char* reason = "unknown";
+        switch (e.reason) {
+            case AbortReason::None:           reason = "none"; break;
+            case AbortReason::TelemetryStale: reason = "telemetry_stale"; break;
+            case AbortReason::LowBattery:     reason = "low_battery"; break;
+            case AbortReason::LinkLost:       reason = "link_lost"; break;
+            case AbortReason::OperatorAbort:  reason = "operator_abort"; break;
+            case AbortReason::MissionTimeout: reason = "mission_timeout"; break;
+        }
+        std::string payload;
+        payload.reserve(48 + e.detail.size());
+        payload += R"({"reason":")";
+        payload += reason;
+        payload += R"(","detail":")";
+        json_escape_into(payload, e.detail);
+        payload += R"("})";
+        emit(safety_channel_id, ++safety_seq, e.t, payload);
     }
 
     static std::string serialize_raw(const RawPacket& pkt) {
@@ -270,6 +407,30 @@ MCAPLogger::create(std::filesystem::path path, std::size_t queue_capacity) {
     mcap::Channel state_channel{"/telemetry/state", "json", state_schema.id};
     impl->writer.addChannel(state_channel);
     impl->state_channel_id = state_channel.id;
+
+    mcap::Schema setpoint_schema{"cfo.Setpoint", "jsonschema", kSetpointSchema};
+    impl->writer.addSchema(setpoint_schema);
+    mcap::Channel setpoint_channel{"/command/setpoint", "json", setpoint_schema.id};
+    impl->writer.addChannel(setpoint_channel);
+    impl->setpoint_channel_id = setpoint_channel.id;
+
+    mcap::Schema safety_schema{"cfo.Safety", "jsonschema", kSafetySchema};
+    impl->writer.addSchema(safety_schema);
+    mcap::Channel safety_channel{"/safety", "json", safety_schema.id};
+    impl->writer.addChannel(safety_channel);
+    impl->safety_channel_id = safety_channel.id;
+
+    mcap::Schema supervisor_schema{"cfo.SupervisorState", "jsonschema", kSupervisorSchema};
+    impl->writer.addSchema(supervisor_schema);
+    mcap::Channel supervisor_channel{"/supervisor", "json", supervisor_schema.id};
+    impl->writer.addChannel(supervisor_channel);
+    impl->supervisor_channel_id = supervisor_channel.id;
+
+    mcap::Schema mission_schema{"cfo.MissionState", "jsonschema", kMissionSchema};
+    impl->writer.addSchema(mission_schema);
+    mcap::Channel mission_channel{"/mission/state", "json", mission_schema.id};
+    impl->writer.addChannel(mission_channel);
+    impl->mission_channel_id = mission_channel.id;
 
     auto* p = impl.get();
     impl->thread = std::thread{[p] { p->run(); }};

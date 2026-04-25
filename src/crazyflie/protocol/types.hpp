@@ -13,15 +13,46 @@ namespace cfo {
 // only what the code uses lives here.
 namespace crtp {
 
-inline constexpr std::uint8_t kPortConsole      = 0;
-inline constexpr std::uint8_t kPortLog          = 5;
-inline constexpr std::uint8_t kPortLinkControl  = 15;
+inline constexpr std::uint8_t kPortConsole          = 0;
+inline constexpr std::uint8_t kPortLog              = 5;
+inline constexpr std::uint8_t kPortGenericSetpoint  = 7;
+inline constexpr std::uint8_t kPortSupervisor       = 9;
+inline constexpr std::uint8_t kPortPlatform         = 13;
+inline constexpr std::uint8_t kPortLinkControl      = 15;
 
-inline constexpr std::uint8_t kChannelConsole       = 0;   // on port 0
-inline constexpr std::uint8_t kChannelLogToc        = 0;   // on port 5
-inline constexpr std::uint8_t kChannelLogSettings   = 1;   // on port 5
-inline constexpr std::uint8_t kChannelLogData       = 2;   // on port 5
-inline constexpr std::uint8_t kChannelLinkControl   = 3;   // on port 15
+inline constexpr std::uint8_t kChannelConsole         = 0;   // on port 0
+inline constexpr std::uint8_t kChannelLogToc          = 0;   // on port 5
+inline constexpr std::uint8_t kChannelLogSettings     = 1;   // on port 5
+inline constexpr std::uint8_t kChannelLogData         = 2;   // on port 5
+inline constexpr std::uint8_t kChannelGenericSetpoint   = 0;   // on port 7
+inline constexpr std::uint8_t kChannelSupervisorInfo    = 0;   // on port 9 — queries
+inline constexpr std::uint8_t kChannelSupervisorCommand = 1;   // on port 9 — commands
+inline constexpr std::uint8_t kChannelPlatformCommand   = 0;   // on port 13
+inline constexpr std::uint8_t kChannelLinkControl       = 3;   // on port 15
+
+// Generic-commander setpoint type codes (cflib commander_generic.py /
+// firmware crtp_commander_generic.c). Only the ones we use are listed.
+inline constexpr std::uint8_t kSetpointStop  = 0;
+inline constexpr std::uint8_t kSetpointHover = 5;
+
+// Arming command IDs.
+//   Modern  (CRTP v12+): SUPERVISOR/ch1, byte CMD_ARM_SYSTEM         = 0x01
+//   Legacy  (pre-v12)  : PLATFORM/ch0,   byte PLATFORM_REQUEST_ARMING = 0x01
+// Same command byte value, different (port, channel) — a coincidence in the
+// cflib constants but we name them separately for clarity.
+inline constexpr std::uint8_t kCmdSupervisorArm        = 0x01;
+inline constexpr std::uint8_t kCmdPlatformRequestArm   = 0x01;
+
+// Supervisor info-channel: ask for the current state bitfield. The firmware
+// echoes the command back with bit 7 set (response flag), followed by the
+// little-endian bitfield bytes (cflib supervisor.py / firmware supervisor.c).
+inline constexpr std::uint8_t kCmdSupervisorGetStateBitfield = 0x0C;
+inline constexpr std::uint8_t kCmdResponseFlag               = 0x80;
+
+// Clears the supervisor's "locked" / "crashed" flags so that subsequent arm
+// requests are accepted. Single-byte payload on SUPERVISOR_CH_COMMAND.
+// Mirrors cflib's send_crash_recovery_request().
+inline constexpr std::uint8_t kCmdSupervisorRecover = 0x02;
 
 // LOG/TOC commands (cflib log.py / toc.py)
 inline constexpr std::uint8_t kCmdTocItemV2          = 0x02;
@@ -113,6 +144,23 @@ struct LogSettingsAck {
     std::uint8_t cmd;
     std::uint8_t block_id;
     std::uint8_t error_code;     // 0 = ok; cflib treats EEXIST as ok for create
+};
+
+// Decoded supervisor state — the 11 bits the firmware sends in response to
+// CMD_GET_STATE_BITFIELD on port 9 / channel 0. Names match cflib's
+// supervisor.py properties.
+struct SupervisorState {
+    bool can_be_armed{};
+    bool is_armed{};
+    bool is_auto_armed{};
+    bool can_fly{};
+    bool is_flying{};
+    bool is_tumbled{};
+    bool is_locked{};
+    bool is_crashed{};
+    bool hl_control_active{};
+    bool hl_traj_finished{};
+    bool hl_control_disabled{};
 };
 
 } // namespace cfo

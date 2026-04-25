@@ -3,7 +3,9 @@
 #include "crazyflie/link/types.hpp"
 #include "crazyflie/protocol/types.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -169,6 +171,143 @@ make_log_start_block(std::uint8_t block_id,
     p.payload[0] = crtp::kCmdLogStartLogging;
     p.payload[1] = block_id;
     p.payload[2] = period_10ms;
+    return p;
+}
+
+// Modern arm/disarm request (CRTP protocol v12+). Required on recent
+// firmware: motors will not spin without an explicit arm, and stop_setpoint
+// disarms — so a second consecutive run silently drops setpoints unless we
+// re-arm first. cflib's `Crazyflie.platform.send_arming_request` forwards
+// to the supervisor service on v12+ firmware.
+[[nodiscard]] inline RawPacket make_arm_request(bool arm) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortSupervisor;
+    p.channel = crtp::kChannelSupervisorCommand;
+    p.size    = 2;
+    p.payload[0] = crtp::kCmdSupervisorArm;
+    p.payload[1] = arm ? std::uint8_t{1} : std::uint8_t{0};
+    return p;
+}
+
+// Legacy arm/disarm request for pre-v12 firmware. Same payload shape, sent
+// to the PLATFORM port instead of SUPERVISOR. cflib's supervisor service
+// falls back to this when the firmware reports an older protocol version.
+// We send both modern and legacy packets at startup so we don't need to
+// negotiate the protocol version up front.
+[[nodiscard]] inline RawPacket make_arm_request_legacy(bool arm) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortPlatform;
+    p.channel = crtp::kChannelPlatformCommand;
+    p.size    = 2;
+    p.payload[0] = crtp::kCmdPlatformRequestArm;
+    p.payload[1] = arm ? std::uint8_t{1} : std::uint8_t{0};
+    return p;
+}
+
+// Clear the supervisor's locked/crashed flags so subsequent arm requests
+// take effect. After a controlled landing the supervisor commonly latches
+// into "locked"; a power-cycle clears it, and so does this command.
+// Mirrors cflib's `Crazyflie.supervisor.send_crash_recovery_request()`.
+[[nodiscard]] inline RawPacket make_supervisor_recover() noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortSupervisor;
+    p.channel = crtp::kChannelSupervisorCommand;
+    p.size    = 1;
+    p.payload[0] = crtp::kCmdSupervisorRecover;
+    return p;
+}
+
+// Ask the supervisor for its current state bitfield (CMD_GET_STATE_BITFIELD).
+// The reply arrives on the same port/channel with the response flag (0x80)
+// OR'd onto the command byte and the bitfield bytes following.
+[[nodiscard]] inline RawPacket make_supervisor_info_request() noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortSupervisor;
+    p.channel = crtp::kChannelSupervisorInfo;
+    p.size    = 1;
+    p.payload[0] = crtp::kCmdSupervisorGetStateBitfield;
+    return p;
+}
+
+// Decode a supervisor state response (port 9 / ch 0, payload[0] == 0x8C,
+// followed by little-endian bitfield bytes). Returns one bool per known
+// state bit.
+[[nodiscard]] inline std::expected<SupervisorState, DecodeError>
+decode_supervisor_state(const RawPacket& pkt) {
+    if (pkt.port != crtp::kPortSupervisor ||
+        pkt.channel != crtp::kChannelSupervisorInfo) {
+        return std::unexpected(DecodeError::WrongPort);
+    }
+    if (pkt.size < 2) return std::unexpected(DecodeError::Truncated);
+    const std::uint8_t expected =
+        crtp::kCmdSupervisorGetStateBitfield | crtp::kCmdResponseFlag;
+    if (pkt.payload[0] != expected) {
+        return std::unexpected(DecodeError::UnexpectedCmd);
+    }
+
+    // Read up to 4 bytes of bitfield (11 bits comfortably fit in 16, but
+    // firmware versions vary — accept whatever's there, capped).
+    std::uint32_t bits = 0;
+    const std::size_t n = std::min<std::size_t>(pkt.size - 1, 4);
+    for (std::size_t i = 0; i < n; ++i) {
+        bits |= static_cast<std::uint32_t>(pkt.payload[1 + i]) << (8 * i);
+    }
+    auto bit = [&](std::uint8_t pos) {
+        return ((bits >> pos) & 1u) != 0;
+    };
+    SupervisorState s{};
+    s.can_be_armed         = bit(0);
+    s.is_armed             = bit(1);
+    s.is_auto_armed        = bit(2);
+    s.can_fly              = bit(3);
+    s.is_flying            = bit(4);
+    s.is_tumbled           = bit(5);
+    s.is_locked            = bit(6);
+    s.is_crashed           = bit(7);
+    s.hl_control_active    = bit(8);
+    s.hl_traj_finished     = bit(9);
+    s.hl_control_disabled  = bit(10);
+    return s;
+}
+
+// Generic-commander STOP setpoint (type 0). Type byte only; firmware
+// disarms motors on receipt. SAFE TO SEND ONLY ON THE GROUND. While
+// airborne this drops the vehicle.
+[[nodiscard]] inline RawPacket make_setpoint_stop() noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortGenericSetpoint;
+    p.channel = crtp::kChannelGenericSetpoint;
+    p.size    = 1;
+    p.payload[0] = crtp::kSetpointStop;
+    return p;
+}
+
+// Generic-commander HOVER setpoint (type 5). Wire layout:
+//   [type:1] [vx:f32 LE] [vy:f32 LE] [yaw_rate:f32 LE] [z_distance:f32 LE]
+// Body-frame velocity (m/s), yaw rate (deg/s), absolute target height
+// above takeoff (m). Total payload = 1 + 16 = 17 bytes. The firmware
+// expects this to be streamed at >= ~10 Hz; gaps cause the commander to
+// time out and stop accepting setpoints.
+[[nodiscard]] inline RawPacket
+make_setpoint_hover(float vx_mps, float vy_mps,
+                    float yaw_rate_dps, float z_target_m) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortGenericSetpoint;
+    p.channel = crtp::kChannelGenericSetpoint;
+    p.size    = 17;
+    p.payload[0] = crtp::kSetpointHover;
+    auto write_f32 = [&](std::size_t off, float v) {
+        std::uint32_t bits;
+        std::memcpy(&bits, &v, 4);
+        p.payload[off + 0] = static_cast<std::uint8_t>(bits & 0xFF);
+        p.payload[off + 1] = static_cast<std::uint8_t>((bits >> 8) & 0xFF);
+        p.payload[off + 2] = static_cast<std::uint8_t>((bits >> 16) & 0xFF);
+        p.payload[off + 3] = static_cast<std::uint8_t>((bits >> 24) & 0xFF);
+    };
+    write_f32(1,  vx_mps);
+    write_f32(5,  vy_mps);
+    write_f32(9,  yaw_rate_dps);
+    write_f32(13, z_target_m);
     return p;
 }
 

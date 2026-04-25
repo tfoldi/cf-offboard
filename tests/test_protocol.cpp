@@ -128,3 +128,20 @@ TEST_CASE("make_null_packet has the link-control shape") {
     // see if it came back from the wire.
     CHECK(cfo::classify(p) == cfo::PacketKind::LinkControl);
 }
+
+TEST_CASE("make_arm_request: SUPERVISOR/CMD_ARM_SYSTEM (cflib v12+ shape)") {
+    SUBCASE("arm=true → SUPERVISOR port, CMD_ARM_SYSTEM, arg=1") {
+        const auto p = cfo::make_arm_request(true);
+        CHECK(p.port == 9);                   // SUPERVISOR
+        CHECK(p.channel == 1);                // SUPERVISOR_CH_COMMAND
+        CHECK(p.size == 2);
+        CHECK(p.payload[0] == 0x01);          // CMD_ARM_SYSTEM
+        CHECK(p.payload[1] == 1);
+    }
+    SUBCASE("arm=false → arg=0") {
+        const auto p = cfo::make_arm_request(false);
+        CHECK(p.size == 2);
+        CHECK(p.payload[0] == 0x01);
+        CHECK(p.payload[1] == 0);
+    }
+}
