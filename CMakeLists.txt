@@ -132,6 +132,18 @@ target_include_directories(cfo_log PUBLIC ${_cfo_src})
 target_link_libraries(cfo_log PUBLIC cfo_link cfo_state)
 
 # ----------------------------------------------------------------------------
+# Crazyflie PARAM bring-up — minimal, narrow: TOC walk to find one named
+# uint8_t parameter and write one value to it. Used to set
+# `commander.enHighLevel = 1` so HLC LAND works. Not a generic param framework.
+# ----------------------------------------------------------------------------
+
+add_library(cfo_param STATIC
+    src/crazyflie/param/param_session.cpp
+)
+target_include_directories(cfo_param PUBLIC ${_cfo_src})
+target_link_libraries(cfo_param PUBLIC cfo_link)
+
+# ----------------------------------------------------------------------------
 # Safety — pure header-only supervisor (check_safety + types).
 # ----------------------------------------------------------------------------
 
@@ -201,8 +213,9 @@ target_link_libraries(cfo_control
 
 add_executable(cf-offboard src/app/main.cpp)
 target_link_libraries(cf-offboard PRIVATE
-    cfo_link cfo_log cfo_logging cfo_state cfo_control cfo_safety cfo_mission
-    cfo_ui Threads::Threads)
+    cfo_link cfo_log cfo_param cfo_logging cfo_state
+    cfo_control cfo_safety cfo_mission cfo_ui
+    Threads::Threads)
 
 # ----------------------------------------------------------------------------
 # Offline tools — debugging and analysis utilities. Self-contained; do not

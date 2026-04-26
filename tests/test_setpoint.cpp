@@ -56,3 +56,25 @@ TEST_CASE("hover with negative z (descent target below ground) is allowed by bui
     CHECK(p.size == 17);
     CHECK(read_f32(p, 13) == doctest::Approx(-0.5f));
 }
+
+TEST_CASE("make_setpoint_notify_stop: type 0xFF + uint32 LE remain_valid_ms") {
+    SUBCASE("default (immediate handoff)") {
+        const auto p = cfo::make_setpoint_notify_stop();
+        CHECK(p.port == 7);
+        CHECK(p.channel == 0);
+        CHECK(p.size == 5);
+        CHECK(p.payload[0] == 0xFF);
+        CHECK(p.payload[1] == 0);
+        CHECK(p.payload[2] == 0);
+        CHECK(p.payload[3] == 0);
+        CHECK(p.payload[4] == 0);
+    }
+    SUBCASE("non-zero grace window encodes little-endian") {
+        const auto p = cfo::make_setpoint_notify_stop(0x12345678u);
+        CHECK(p.payload[0] == 0xFF);
+        CHECK(p.payload[1] == 0x78);
+        CHECK(p.payload[2] == 0x56);
+        CHECK(p.payload[3] == 0x34);
+        CHECK(p.payload[4] == 0x12);
+    }
+}

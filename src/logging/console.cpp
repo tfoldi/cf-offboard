@@ -16,6 +16,7 @@ namespace cfo::console {
 namespace {
 std::atomic<cfo::EventLog*> g_event_log{nullptr};
 std::atomic<bool>           g_stderr_silent{false};
+std::atomic<std::FILE*>     g_log_file{nullptr};
 }
 
 void set_event_log(cfo::EventLog* log) {
@@ -24,6 +25,10 @@ void set_event_log(cfo::EventLog* log) {
 
 void set_stderr_silent(bool silent) {
     g_stderr_silent.store(silent, std::memory_order_release);
+}
+
+void set_log_file(std::FILE* f) {
+    g_log_file.store(f, std::memory_order_release);
 }
 
 } // namespace cfo::console
@@ -83,9 +88,10 @@ void emit(Level level, std::string_view formatted) {
         log->push(std::move(e));
     }
 
-    if (::cfo::console::g_stderr_silent.load(std::memory_order_acquire)) {
-        return;
-    }
+    const bool to_stderr =
+        !::cfo::console::g_stderr_silent.load(std::memory_order_acquire);
+    auto* logf = ::cfo::console::g_log_file.load(std::memory_order_acquire);
+    if (!to_stderr && !logf) return;
 
     const auto t = system_clock::to_time_t(now);
     const auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
@@ -100,15 +106,25 @@ void emit(Level level, std::string_view formatted) {
                   tm.tm_hour, tm.tm_min, tm.tm_sec,
                   static_cast<int>(ms.count()));
 
-    const bool color = color_enabled();
-    const char* col = color ? level_color(level) : "";
-    const char* rst = color ? kReset : "";
-
     std::lock_guard lock{g_mutex};
-    std::fprintf(stderr, "%s %s%s%s %.*s\n",
-                 ts, col, level_tag(level), rst,
-                 static_cast<int>(formatted.size()), formatted.data());
-    std::fflush(stderr);
+
+    if (to_stderr) {
+        const bool color = color_enabled();
+        const char* col = color ? level_color(level) : "";
+        const char* rst = color ? kReset : "";
+        std::fprintf(stderr, "%s %s%s%s %.*s\n",
+                     ts, col, level_tag(level), rst,
+                     static_cast<int>(formatted.size()), formatted.data());
+        std::fflush(stderr);
+    }
+
+    if (logf) {
+        // No ANSI colors in the file — it's a plain log for grep/diff.
+        std::fprintf(logf, "%s %s %.*s\n",
+                     ts, level_tag(level),
+                     static_cast<int>(formatted.size()), formatted.data());
+        std::fflush(logf);
+    }
 }
 
 } // namespace cfo::console::detail

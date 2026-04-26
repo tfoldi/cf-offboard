@@ -38,6 +38,17 @@ void put_u24(cfo::RawPacket& p, std::size_t off, std::uint32_t v) {
     p.payload[off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xFF);
 }
 
+float read_f32(const cfo::RawPacket& p, std::size_t off) {
+    std::uint32_t bits =
+        static_cast<std::uint32_t>(p.payload[off + 0]) |
+        (static_cast<std::uint32_t>(p.payload[off + 1]) << 8) |
+        (static_cast<std::uint32_t>(p.payload[off + 2]) << 16) |
+        (static_cast<std::uint32_t>(p.payload[off + 3]) << 24);
+    float v;
+    std::memcpy(&v, &bits, 4);
+    return v;
+}
+
 } // namespace
 
 TEST_CASE("fp16_to_float covers IEEE 754 half-precision corner cases") {
@@ -205,6 +216,185 @@ TEST_CASE("decode_log_settings_ack") {
     SUBCASE("truncated") {
         const auto p = pkt(5, 1, {0x06, 0x00});
         CHECK(cfo::decode_log_settings_ack(p).error() == cfo::DecodeError::Truncated);
+    }
+}
+
+TEST_CASE("make_hlc_land: 15-byte payload, IEEE-754 LE") {
+    const auto p = cfo::make_hlc_land(/*height=*/0.0f, /*duration=*/2.0f);
+    CHECK(p.port == 8);    // SETPOINT_HL
+    CHECK(p.channel == 0);
+    CHECK(p.size == 15);
+    CHECK(p.payload[0] == 0x08);   // COMMAND_LAND_2
+    CHECK(p.payload[1] == 0);      // group_mask
+    CHECK(read_f32(p, 2)  == doctest::Approx(0.0f));   // height
+    CHECK(read_f32(p, 6)  == doctest::Approx(0.0f));   // yaw
+    CHECK(p.payload[10] == 1);                          // use_current_yaw=true (default)
+    CHECK(read_f32(p, 11) == doctest::Approx(2.0f));   // duration
+}
+
+TEST_CASE("make_hlc_stop: 2-byte payload (opcode + group_mask)") {
+    SUBCASE("default group_mask=0") {
+        const auto p = cfo::make_hlc_stop();
+        CHECK(p.port == 8);
+        CHECK(p.channel == 0);
+        CHECK(p.size == 2);
+        CHECK(p.payload[0] == 0x03);   // COMMAND_STOP
+        CHECK(p.payload[1] == 0);
+    }
+    SUBCASE("explicit group_mask") {
+        const auto p = cfo::make_hlc_stop(0xAA);
+        CHECK(p.size == 2);
+        CHECK(p.payload[1] == 0xAA);
+    }
+}
+
+TEST_CASE("make_hlc_takeoff: same 15-byte layout as LAND, opcode 0x07") {
+    const auto p = cfo::make_hlc_takeoff(/*height=*/0.30f, /*duration=*/1.5f);
+    CHECK(p.port == 8);
+    CHECK(p.channel == 0);
+    CHECK(p.size == 15);
+    CHECK(p.payload[0] == 0x07);   // COMMAND_TAKEOFF_2
+    CHECK(p.payload[1] == 0);
+    CHECK(read_f32(p, 2)  == doctest::Approx(0.30f));
+    CHECK(read_f32(p, 6)  == doctest::Approx(0.0f));
+    CHECK(p.payload[10] == 1);     // use_current_yaw default
+    CHECK(read_f32(p, 11) == doctest::Approx(1.5f));
+}
+
+TEST_CASE("make_hlc_go_to: 24-byte payload (cflib COMMAND_GO_TO_2)") {
+    SUBCASE("relative=true (default), linear=false") {
+        const auto p = cfo::make_hlc_go_to(0.225f, 0, 0, 0, 1.5f);
+        CHECK(p.port == 8);
+        CHECK(p.channel == 0);
+        CHECK(p.size == 24);
+        CHECK(p.payload[0] == 0x0C);   // COMMAND_GO_TO_2
+        CHECK(p.payload[1] == 0);      // group_mask
+        CHECK(p.payload[2] == 1);      // relative
+        CHECK(p.payload[3] == 0);      // linear
+        CHECK(read_f32(p, 4)  == doctest::Approx(0.225f));   // x
+        CHECK(read_f32(p, 8)  == doctest::Approx(0.0f));     // y
+        CHECK(read_f32(p, 12) == doctest::Approx(0.0f));     // z
+        CHECK(read_f32(p, 16) == doctest::Approx(0.0f));     // yaw
+        CHECK(read_f32(p, 20) == doctest::Approx(1.5f));     // duration
+    }
+    SUBCASE("absolute, linear, group_mask, all axes set") {
+        const auto p = cfo::make_hlc_go_to(1.0f, -0.5f, 0.4f,
+                                           1.5708f, 2.0f,
+                                           /*relative=*/false,
+                                           /*linear=*/true,
+                                           /*group_mask=*/0x0F);
+        CHECK(p.payload[1] == 0x0F);
+        CHECK(p.payload[2] == 0);   // relative=false
+        CHECK(p.payload[3] == 1);   // linear=true
+        CHECK(read_f32(p, 4)  == doctest::Approx(1.0f));
+        CHECK(read_f32(p, 8)  == doctest::Approx(-0.5f));
+        CHECK(read_f32(p, 12) == doctest::Approx(0.4f));
+        CHECK(read_f32(p, 16) == doctest::Approx(1.5708f));
+        CHECK(read_f32(p, 20) == doctest::Approx(2.0f));
+    }
+}
+
+TEST_CASE("make_hlc_land: explicit yaw, group_mask, custom height") {
+    const auto p = cfo::make_hlc_land(0.05f, 2.5f,
+                                       /*use_current_yaw=*/false,
+                                       /*yaw_rad=*/1.5708f,
+                                       /*group_mask=*/0xAA);
+    CHECK(p.payload[1] == 0xAA);
+    CHECK(read_f32(p, 2)  == doctest::Approx(0.05f));
+    CHECK(read_f32(p, 6)  == doctest::Approx(1.5708f));
+    CHECK(p.payload[10] == 0);
+    CHECK(read_f32(p, 11) == doctest::Approx(2.5f));
+}
+
+TEST_CASE("make_param_toc_info_v2_request: PARAM TOC, single byte CMD_TOC_INFO_V2") {
+    const auto p = cfo::make_param_toc_info_v2_request();
+    CHECK(p.port == 2);
+    CHECK(p.channel == 0);
+    CHECK(p.size == 1);
+    CHECK(p.payload[0] == 0x03);
+}
+
+TEST_CASE("make_param_toc_item_v2_request: PARAM TOC, cmd + uint16 LE index") {
+    const auto p = cfo::make_param_toc_item_v2_request(0x0142);
+    CHECK(p.port == 2);
+    CHECK(p.channel == 0);
+    CHECK(p.size == 3);
+    CHECK(p.payload[0] == 0x02);
+    CHECK(p.payload[1] == 0x42);
+    CHECK(p.payload[2] == 0x01);
+}
+
+TEST_CASE("make_param_write_uint8: var_id LE + value byte on WRITE channel") {
+    const auto p = cfo::make_param_write_uint8(0x0BAD, 0x77);
+    CHECK(p.port == 2);
+    CHECK(p.channel == 2);   // WRITE_CHANNEL
+    CHECK(p.size == 3);
+    CHECK(p.payload[0] == 0xAD);
+    CHECK(p.payload[1] == 0x0B);
+    CHECK(p.payload[2] == 0x77);
+}
+
+TEST_CASE("decode_param_toc_info_v2: same wire shape as LOG TOC info") {
+    const auto p = pkt(2, 0, {0x03, 0x39, 0x01, 0xDE, 0xAD, 0xBE, 0xEF});
+    auto r = cfo::decode_param_toc_info_v2(p);
+    REQUIRE(r);
+    CHECK(r->count == 0x0139);
+    CHECK(r->crc == 0xEFBEADDEu);
+}
+
+TEST_CASE("decode_param_toc_item_v2: metadata byte holds type + flags + r/o bit") {
+    SUBCASE("uint8 commander.enHighLevel") {
+        cfo::RawPacket p{};
+        p.port = 2; p.channel = 0;
+        const std::uint8_t bytes[] = {
+            0x02, 0x42, 0x00,                       // cmd + index 0x0042
+            0x08,                                   // metadata: type uint8, no flags
+            'c','o','m','m','a','n','d','e','r','\0',
+            'e','n','H','i','g','h','L','e','v','e','l','\0'
+        };
+        p.size = sizeof(bytes);
+        std::memcpy(p.payload.data(), bytes, sizeof(bytes));
+        auto r = cfo::decode_param_toc_item_v2(p);
+        REQUIRE(r);
+        CHECK(r->index == 0x0042);
+        CHECK(r->type_code == 0x08);   // uint8
+        CHECK(r->read_only == false);
+        CHECK(r->group == "commander");
+        CHECK(r->name == "enHighLevel");
+    }
+    SUBCASE("read-only bit (0x40) is decoded") {
+        cfo::RawPacket p{};
+        p.port = 2; p.channel = 0;
+        const std::uint8_t bytes[] = {
+            0x02, 0x00, 0x00,
+            0x48,                       // 0x40 (r/o) | 0x08 (uint8)
+            'g','\0', 'n','\0'
+        };
+        p.size = sizeof(bytes);
+        std::memcpy(p.payload.data(), bytes, sizeof(bytes));
+        auto r = cfo::decode_param_toc_item_v2(p);
+        REQUIRE(r);
+        CHECK(r->type_code == 0x08);
+        CHECK(r->read_only == true);
+    }
+}
+
+TEST_CASE("is_param_write_ack: matches firmware echo on WRITE channel") {
+    SUBCASE("matching var_id returns true") {
+        const auto p = pkt(2, 2, {0x42, 0x01, 0x77});
+        CHECK(cfo::is_param_write_ack(p, 0x0142) == true);
+    }
+    SUBCASE("non-matching var_id returns false") {
+        const auto p = pkt(2, 2, {0x42, 0x01});
+        CHECK(cfo::is_param_write_ack(p, 0x0143) == false);
+    }
+    SUBCASE("wrong channel is not an ack") {
+        const auto p = pkt(2, 0, {0x42, 0x01});
+        CHECK(cfo::is_param_write_ack(p, 0x0142) == false);
+    }
+    SUBCASE("truncated packet is not an ack") {
+        const auto p = pkt(2, 2, {0x42});
+        CHECK(cfo::is_param_write_ack(p, 0x0042) == false);
     }
 }
 

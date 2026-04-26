@@ -14,17 +14,23 @@ namespace cfo {
 namespace crtp {
 
 inline constexpr std::uint8_t kPortConsole          = 0;
+inline constexpr std::uint8_t kPortParam            = 2;
 inline constexpr std::uint8_t kPortLog              = 5;
 inline constexpr std::uint8_t kPortGenericSetpoint  = 7;
+inline constexpr std::uint8_t kPortHighLevelCmd     = 8;
 inline constexpr std::uint8_t kPortSupervisor       = 9;
 inline constexpr std::uint8_t kPortPlatform         = 13;
 inline constexpr std::uint8_t kPortLinkControl      = 15;
 
 inline constexpr std::uint8_t kChannelConsole         = 0;   // on port 0
+inline constexpr std::uint8_t kChannelParamToc        = 0;   // on port 2
+inline constexpr std::uint8_t kChannelParamRead       = 1;   // on port 2
+inline constexpr std::uint8_t kChannelParamWrite      = 2;   // on port 2
 inline constexpr std::uint8_t kChannelLogToc          = 0;   // on port 5
 inline constexpr std::uint8_t kChannelLogSettings     = 1;   // on port 5
 inline constexpr std::uint8_t kChannelLogData         = 2;   // on port 5
 inline constexpr std::uint8_t kChannelGenericSetpoint   = 0;   // on port 7
+inline constexpr std::uint8_t kChannelHighLevelCmd      = 0;   // on port 8
 inline constexpr std::uint8_t kChannelSupervisorInfo    = 0;   // on port 9 — queries
 inline constexpr std::uint8_t kChannelSupervisorCommand = 1;   // on port 9 — commands
 inline constexpr std::uint8_t kChannelPlatformCommand   = 0;   // on port 13
@@ -32,8 +38,9 @@ inline constexpr std::uint8_t kChannelLinkControl       = 3;   // on port 15
 
 // Generic-commander setpoint type codes (cflib commander_generic.py /
 // firmware crtp_commander_generic.c). Only the ones we use are listed.
-inline constexpr std::uint8_t kSetpointStop  = 0;
-inline constexpr std::uint8_t kSetpointHover = 5;
+inline constexpr std::uint8_t kSetpointStop       = 0;
+inline constexpr std::uint8_t kSetpointHover      = 5;
+inline constexpr std::uint8_t kSetpointNotifyStop = 0xFF;
 
 // Arming command IDs.
 //   Modern  (CRTP v12+): SUPERVISOR/ch1, byte CMD_ARM_SYSTEM         = 0x01
@@ -53,6 +60,25 @@ inline constexpr std::uint8_t kCmdResponseFlag               = 0x80;
 // requests are accepted. Single-byte payload on SUPERVISOR_CH_COMMAND.
 // Mirrors cflib's send_crash_recovery_request().
 inline constexpr std::uint8_t kCmdSupervisorRecover = 0x02;
+
+// PARAM TOC uses the same V2 command codes as LOG TOC (kCmdTocItemV2,
+// kCmdTocInfoV2). The element payload differs: a metadata byte (low
+// nibble = type, bit 4 = extended, bit 6 = read-only) followed by the
+// null-terminated group + name strings.
+inline constexpr std::uint8_t kParamTypeFlagExtended = 0x10;
+inline constexpr std::uint8_t kParamTypeFlagReadonly = 0x40;
+inline constexpr std::uint8_t kParamTypeMaskCore     = 0x0F;
+
+// PARAM type codes (cflib param.py types map). Different numbering from
+// LOG. We only handle uint8_t in the WRITE builder for slice (d) since
+// the only param we set is `commander.enHighLevel` (uint8_t).
+inline constexpr std::uint8_t kParamTypeUint8  = 0x08;
+
+// High-level commander opcodes (cflib high_level_commander.py).
+inline constexpr std::uint8_t kCmdHlcStop      = 0x03;
+inline constexpr std::uint8_t kCmdHlcTakeoff2  = 0x07;
+inline constexpr std::uint8_t kCmdHlcLand2     = 0x08;
+inline constexpr std::uint8_t kCmdHlcGoTo2     = 0x0C;
 
 // LOG/TOC commands (cflib log.py / toc.py)
 inline constexpr std::uint8_t kCmdTocItemV2          = 0x02;
@@ -121,6 +147,19 @@ struct LogTocItem {
     std::string   group;     // e.g. "stateEstimate"
     std::string   name;      // e.g. "x"
 };
+
+// One PARAM TOC item. Same shape as LogTocItem but the low-nibble type
+// space is different (LOG vs PARAM use different numeric codes).
+struct ParamTocItem {
+    std::uint16_t index;
+    std::uint8_t  type_code;   // low nibble of the metadata byte
+    bool          read_only;   // bit 6 of the metadata byte
+    std::string   group;
+    std::string   name;
+};
+
+// Reuses LogTocInfo's shape (count + crc) — the wire format is identical.
+using ParamTocInfo = LogTocInfo;
 
 // Variable spec for CMD_CREATE_BLOCK_V2 — stored/fetched type byte plus the
 // resolved variable id from the TOC.

@@ -11,6 +11,7 @@
 // Output is synchronous (stderr is fast); a single mutex serializes lines so
 // concurrent threads do not interleave. Color is auto-detected via isatty.
 
+#include <cstdio>
 #include <format>
 #include <string_view>
 #include <utility>
@@ -26,6 +27,11 @@ namespace cfo::console {
 // and/or silence stderr when the TUI owns the screen.
 void set_event_log(cfo::EventLog* log);
 void set_stderr_silent(bool silent);
+
+// Mirror every console line to a FILE* (no ANSI colors). Pass nullptr to
+// detach. Caller owns the FILE* lifetime; typical use is to fopen at
+// startup, set here, and fclose at shutdown after detaching.
+void set_log_file(std::FILE* f);
 
 namespace detail {
 

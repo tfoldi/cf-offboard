@@ -4,6 +4,7 @@
 #include "crazyflie/link/interfaces.hpp"
 #include "crazyflie/link/types.hpp"
 #include "crazyflie/log/log_session.hpp"
+#include "crazyflie/param/param_session.hpp"
 #include "crazyflie/protocol/protocol.hpp"
 #include "crazyflie/protocol/types.hpp"
 #include "logging/console.hpp"
@@ -78,6 +79,7 @@ void log_setup_progress(const cfo::LogSetupProgress& p) {
 struct CliArgs {
     std::optional<std::string> uri;
     std::optional<std::string> mcap_path;
+    std::optional<std::string> console_log_path;
     bool force_headless{false};
 };
 
@@ -87,6 +89,10 @@ CliArgs parse_args(int argc, char** argv) {
         std::string_view s = argv[i];
         if (s == "--headless") {
             a.force_headless = true;
+        } else if (s == "--console-log" && i + 1 < argc) {
+            a.console_log_path = std::string{argv[++i]};
+        } else if (s == "--no-console-log") {
+            a.console_log_path = std::string{};   // explicit disable
         } else if (!a.uri) {
             a.uri = std::string{s};
         } else if (!a.mcap_path) {
@@ -102,8 +108,9 @@ int main(int argc, char** argv) {
     const auto cli = parse_args(argc, argv);
 
     cfo::AppConfig cfg;
-    if (cli.uri)       cfg.crazyflie_uri = *cli.uri;
-    if (cli.mcap_path) cfg.mcap_path     = *cli.mcap_path;
+    if (cli.uri)              cfg.crazyflie_uri      = *cli.uri;
+    if (cli.mcap_path)        cfg.mcap_path          = *cli.mcap_path;
+    if (cli.console_log_path) cfg.console_log_path   = *cli.console_log_path;
 
     const bool tui_mode =
         !cli.force_headless && ::isatty(STDIN_FILENO) != 0 &&
@@ -122,9 +129,26 @@ int main(int argc, char** argv) {
     });
 
     // Wire console: always feed the event log; silence stderr only when the
-    // TUI owns the screen.
+    // TUI owns the screen. Mirror to a plain-text file for post-mortem
+    // debugging (truncated each run — this is a tail of the last flight,
+    // not history).
     cfo::console::set_event_log(&events);
     cfo::console::set_stderr_silent(tui_mode);
+
+    std::FILE* console_log_file = nullptr;
+    if (!cfg.console_log_path.empty()) {
+        console_log_file = std::fopen(cfg.console_log_path.c_str(), "w");
+        if (console_log_file) {
+            cfo::console::set_log_file(console_log_file);
+        }
+    }
+    auto close_console_log = [&] {
+        cfo::console::set_log_file(nullptr);
+        if (console_log_file) {
+            std::fclose(console_log_file);
+            console_log_file = nullptr;
+        }
+    };
 
     cfo::console::info("cf-offboard starting ({} mode)",
                        tui_mode ? "TUI" : "headless");
@@ -147,6 +171,7 @@ int main(int argc, char** argv) {
         // return; the guard inside run_tui only runs when the loop exits.
         g_shutdown.store(true, std::memory_order_release);
         if (tui_thread.joinable()) tui_thread.join();
+        close_console_log();
         return code;
     };
 
@@ -209,6 +234,27 @@ int main(int argc, char** argv) {
         return bail(3);
     }
     cfo::console::info("LOG: setup complete — telemetry active");
+
+    // ----- PARAM bring-up: enable the high-level commander ---------------
+    // HLC defaults to 0 in firmware. Without this, HLC LAND is silently
+    // dropped and the mission's landing phase doesn't happen.
+    {
+        auto pt = [&](const cfo::RawPacket& p) {
+            const auto t = std::chrono::system_clock::now();
+            logger.log(cfo::RawTelemetryEvent{p, t});
+        };
+        cfo::console::info("PARAM: setting commander.enHighLevel=1");
+        auto r = cfo::write_uint8_param(link, "commander", "enHighLevel", 1, pt);
+        if (!r) {
+            cfo::console::error("PARAM setup failed: {}", r.error().detail);
+            logger.log(make_link_event(cfo::LinkState::Error,
+                                       std::string{"param_setup: "} + r.error().detail));
+            logger.log(make_link_event(cfo::LinkState::Closed, cfg.crazyflie_uri));
+            logger.close();
+            return bail(4);
+        }
+        cfo::console::info("PARAM: commander.enHighLevel set");
+    }
 
     // ----- supervisor pre-arm sanity check + recover ----------------------
     bool supervisor_ok = true;
@@ -353,137 +399,116 @@ int main(int argc, char** argv) {
         cfo::console::info("ready to fly");
     }
 
-    // ----- mission start: explicit in TUI mode, automatic in headless -----
-    bool armed = false;
-    std::thread control_thread;
+    // ----- mission run-loop ------------------------------------------------
+    // TUI mode: each press of 's' kicks off a fresh mission; 'q' exits the
+    // loop. Headless mode: one auto-started mission, then exit.
+    //
+    // No explicit supervisor disarm at end of run — HLC STOP (emitted by
+    // the mission state machine on completion or abort) disarms the motors
+    // on the same authority that just landed the vehicle. Mixing in a
+    // low-level disarm here is what previously latched the supervisor
+    // into is_locked between runs.
     if (ready_to_fly) {
-        if (tui_mode) {
-            cfo::console::info("press [s] to start the mission");
-            using namespace std::chrono_literals;
-            while (!g_shutdown.load(std::memory_order_acquire) &&
-                   !intents.start_mission.exchange(false,
-                                                    std::memory_order_acq_rel)) {
-                std::this_thread::sleep_for(20ms);
-            }
-        }
+        cfo::ControlLoopConfig ctrl_cfg{};
+        const auto& m = ctrl_cfg.mission;
+        cfo::console::info(
+            "mission: takeoff {:.2f}m, fwd {:.2f}m/s "
+            "(takeoff {}ms / hover {}ms / fwd {}ms / preland {}ms / "
+            "hlc_land {}ms)",
+            m.target_height_m, m.forward_velocity_mps,
+            m.takeoff_duration.count(), m.hover_duration.count(),
+            m.forward_duration.count(), m.preland_hover_duration.count(),
+            m.hlc_land_duration.count());
 
-        if (!g_shutdown.load(std::memory_order_acquire)) {
+        while (true) {
+            if (tui_mode) {
+                cfo::console::info("press [s] to start the mission");
+                using namespace std::chrono_literals;
+                while (!g_shutdown.load(std::memory_order_acquire) &&
+                       !intents.quit.load(std::memory_order_acquire)) {
+                    if (intents.start_mission.exchange(
+                            false, std::memory_order_acq_rel)) break;
+                    std::this_thread::sleep_for(20ms);
+                }
+                if (g_shutdown.load(std::memory_order_acquire) ||
+                    intents.quit.load(std::memory_order_acquire)) break;
+            }
+
+            // Re-arm before each mission. HLC STOP at the end of the
+            // previous mission disarmed the supervisor; the next HLC
+            // TAKEOFF needs an arm. Idempotent on the first run.
             const auto t_arm = std::chrono::system_clock::now();
             const auto arm_modern = cfo::make_arm_request(true);
             const auto arm_legacy = cfo::make_arm_request_legacy(true);
             const bool ok_modern = static_cast<bool>(link.send(arm_modern));
             const bool ok_legacy = static_cast<bool>(link.send(arm_legacy));
-            if (ok_modern || ok_legacy) {
-                if (ok_modern) logger.log(cfo::RawCommandEvent{arm_modern, t_arm});
-                if (ok_legacy) logger.log(cfo::RawCommandEvent{arm_legacy, t_arm});
-                cfo::console::info("supervisor: arm requested (modern={}, legacy={})",
-                                   ok_modern, ok_legacy);
-                armed = true;
-            } else {
-                cfo::console::error("supervisor: arm send failed — aborting flight");
-                g_shutdown.store(true, std::memory_order_release);
+            if (!(ok_modern || ok_legacy)) {
+                cfo::console::error(
+                    "supervisor: arm send failed — skipping mission");
+                if (!tui_mode) break;
+                continue;
             }
+            if (ok_modern) logger.log(cfo::RawCommandEvent{arm_modern, t_arm});
+            if (ok_legacy) logger.log(cfo::RawCommandEvent{arm_legacy, t_arm});
+            cfo::console::info("supervisor: arm requested");
 
-            if (armed) {
-                cfo::ControlLoopConfig ctrl_cfg{};
-                const auto& m = ctrl_cfg.mission;
-                cfo::console::info(
-                    "mission: takeoff {:.2f}m, fwd {:.2f}m/s "
-                    "(takeoff {}ms / hover {}ms / fwd {}ms / preland {}ms / land {}ms)",
-                    m.target_height_m, m.forward_velocity_mps,
-                    m.takeoff_duration.count(), m.hover_duration.count(),
-                    m.forward_duration.count(), m.preland_hover_duration.count(),
-                    m.land_duration.count());
-                app_status.update([](cfo::AppStatus& s) {
-                    s.mission_active = true;
-                    s.mission_state  = cfo::MissionState::Idle;
-                });
+            // Reset mission status for the new run.
+            app_status.update([](cfo::AppStatus& s) {
+                s.mission_active = true;
+                s.mission_state  = cfo::MissionState::Idle;
+                s.last_abort_reason = cfo::AbortReason::None;
+            });
 
-                // `control_shutdown` is the mission-scoped abort signal,
-                // distinct from app-scoped `g_shutdown`. mission completion
-                // doesn't shut down the app — in TUI mode we still wait
-                // for the operator to press 'q'.
-                std::atomic<bool> control_shutdown{false};
+            // `control_shutdown` is mission-scoped: app-wide quit and
+            // operator abort both turn into mission abort, but the mission
+            // ending does NOT shut down the app.
+            std::atomic<bool> control_shutdown{false};
 
-                control_thread = std::thread{[&] {
-                    cfo::run_control_loop(
-                        link, state, logger, ctrl_cfg, control_shutdown,
-                        [&](cfo::MissionState ms, cfo::AbortReason ar) {
-                            app_status.update([&](cfo::AppStatus& s) {
-                                s.mission_state = ms;
-                                if (ar != cfo::AbortReason::None) {
-                                    s.last_abort_reason = ar;
-                                }
-                            });
+            std::thread control_thread{[&] {
+                cfo::run_control_loop(
+                    link, state, logger, ctrl_cfg, control_shutdown,
+                    [&](cfo::MissionState ms, cfo::AbortReason ar) {
+                        app_status.update([&](cfo::AppStatus& s) {
+                            s.mission_state = ms;
+                            if (ar != cfo::AbortReason::None) {
+                                s.last_abort_reason = ar;
+                            }
                         });
-                }};
+                    });
+            }};
 
-                // Bridge: operator abort or app-wide shutdown both turn
-                // into a mission abort. Polled — finer-grained signaling
-                // is overkill for v1.
-                std::thread mission_watchdog{[&] {
-                    using namespace std::chrono_literals;
-                    while (!control_shutdown.load(std::memory_order_acquire)) {
-                        if (intents.abort_mission.exchange(
-                                false, std::memory_order_acq_rel)) {
-                            cfo::console::warn("operator abort requested");
-                            control_shutdown.store(
-                                true, std::memory_order_release);
-                            break;
-                        }
-                        if (g_shutdown.load(std::memory_order_acquire)) {
-                            // App-wide shutdown — also bring down the mission
-                            // gracefully (control loop will see this via its
-                            // shutdown_requested parameter).
-                            control_shutdown.store(
-                                true, std::memory_order_release);
-                            break;
-                        }
-                        std::this_thread::sleep_for(20ms);
+            std::thread mission_watchdog{[&] {
+                using namespace std::chrono_literals;
+                while (!control_shutdown.load(std::memory_order_acquire)) {
+                    if (intents.abort_mission.exchange(
+                            false, std::memory_order_acq_rel)) {
+                        cfo::console::warn("operator abort requested");
+                        control_shutdown.store(true, std::memory_order_release);
+                        break;
                     }
-                }};
+                    if (g_shutdown.load(std::memory_order_acquire)) {
+                        control_shutdown.store(true, std::memory_order_release);
+                        break;
+                    }
+                    std::this_thread::sleep_for(20ms);
+                }
+            }};
 
-                control_thread.join();
-                // Wake the watchdog if it's still spinning (mission
-                // completed naturally without an abort).
-                control_shutdown.store(true, std::memory_order_release);
-                mission_watchdog.join();
+            control_thread.join();
+            control_shutdown.store(true, std::memory_order_release);
+            mission_watchdog.join();
 
-                app_status.update([](cfo::AppStatus& s) {
-                    s.mission_active = false;
-                });
-            }
+            app_status.update([](cfo::AppStatus& s) {
+                s.mission_active = false;
+            });
+
+            if (!tui_mode) break;   // headless: single mission per process
         }
     }
 
-    // Explicit disarm.
-    if (armed) {
-        const auto t_disarm = std::chrono::system_clock::now();
-        const auto disarm_modern = cfo::make_arm_request(false);
-        const auto disarm_legacy = cfo::make_arm_request_legacy(false);
-        if (auto r = link.send(disarm_modern); r) {
-            logger.log(cfo::RawCommandEvent{disarm_modern, t_disarm});
-        }
-        if (auto r = link.send(disarm_legacy); r) {
-            logger.log(cfo::RawCommandEvent{disarm_legacy, t_disarm});
-        }
-        cfo::console::info("supervisor: disarm requested");
-    }
-
-    // ----- TUI mode: wait for explicit quit before tearing down -----------
-    if (tui_mode) {
-        cfo::console::info("press [q] to exit");
-        using namespace std::chrono_literals;
-        while (!g_shutdown.load(std::memory_order_acquire) &&
-               !intents.quit.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(50ms);
-        }
-        // signal RX to wind down so it can be joined cleanly
-        g_shutdown.store(true, std::memory_order_release);
-    } else {
-        // Headless: just exit when we get here.
-        g_shutdown.store(true, std::memory_order_release);
-    }
+    // Loop has exited (operator quit, signal, or single headless mission
+    // completed). Signal the RX thread to wind down.
+    g_shutdown.store(true, std::memory_order_release);
 
     rx_thread.join();
     if (tui_thread.joinable()) tui_thread.join();
@@ -496,5 +521,6 @@ int main(int argc, char** argv) {
         cfo::console::warn("dropped {} log events (queue full)", dropped);
     }
     cfo::console::info("cf-offboard exited");
+    close_console_log();
     return 0;
 }

@@ -333,13 +333,15 @@ void paint_footer(const AppStatus& s, int row) {
         std::printf("%s[a]%s abort   %s[q]%s quit (refused while flying)%s",
                     kBold.data(), kReset.data(), kFgGray.data(), kReset.data(),
                     kClearToEol.data());
-    } else if (s.ready_to_fly && s.mission_state == MissionState::Idle) {
-        std::printf("%s[s]%s start   %s[q]%s quit%s",
-                    kBold.data(), kReset.data(),
-                    kBold.data(), kReset.data(), kClearToEol.data());
-    } else if (s.mission_state == MissionState::Completed ||
-               s.mission_state == MissionState::Aborted) {
-        std::printf("%s[q]%s quit%s",
+    } else if (s.ready_to_fly) {
+        // Pre-arm checks passed and no mission is running. 's' starts a
+        // new mission whether or not a previous one already ran.
+        const char* hint =
+            (s.mission_state == MissionState::Completed) ? " (new)"  :
+            (s.mission_state == MissionState::Aborted)   ? " (retry)":
+            "";
+        std::printf("%s[s]%s start%s   %s[q]%s quit%s",
+                    kBold.data(), kReset.data(), hint,
                     kBold.data(), kReset.data(), kClearToEol.data());
     } else {
         std::printf("%s[q]%s quit (forces shutdown)%s",
@@ -369,8 +371,10 @@ void handle_keys(OperatorIntents& intents, AppStatusStore& mutable_status,
                     break;
                 case 's':
                 case 'S':
-                    if (s.ready_to_fly && !s.mission_active &&
-                        s.mission_state == MissionState::Idle) {
+                    // Allow start whenever we're armed-and-ready and a
+                    // mission isn't already running. Past mission state
+                    // (Completed / Aborted) doesn't gate the next start.
+                    if (s.ready_to_fly && !s.mission_active) {
                         intents.start_mission.store(true,
                                                     std::memory_order_release);
                     }

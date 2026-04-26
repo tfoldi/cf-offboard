@@ -13,6 +13,10 @@ struct AppConfig {
     std::string crazyflie_uri{"radio://0/80/2M/E7E7E7E7E7"};
     std::chrono::milliseconds rx_poll_timeout{50};
     std::filesystem::path mcap_path{"flight.mcap"};
+
+    // Plain-text mirror of every console line. Truncated each run — this
+    // is for post-flight debugging, not history. Empty disables it.
+    std::filesystem::path console_log_path{"flight.console.log"};
 };
 
 } // namespace cfo

@@ -282,6 +282,26 @@ decode_supervisor_state(const RawPacket& pkt) {
     return p;
 }
 
+// Generic-commander NOTIFY_SETPOINT_STOP (type 0xFF). Wire layout:
+//   [type:1=0xFF] [remain_valid_ms:u32 LE]
+// Tells the firmware "low-level setpoint streaming has ended, hand off
+// to the high-level commander after `remain_valid_ms` of grace". Without
+// this packet, the low-level commander stays priority-active and HLC
+// LAND is silently ignored. cflib calls this `send_notify_setpoint_stop`.
+[[nodiscard]] inline RawPacket
+make_setpoint_notify_stop(std::uint32_t remain_valid_ms = 0) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortGenericSetpoint;
+    p.channel = crtp::kChannelGenericSetpoint;
+    p.size    = 5;
+    p.payload[0] = crtp::kSetpointNotifyStop;
+    p.payload[1] = static_cast<std::uint8_t>(remain_valid_ms & 0xFF);
+    p.payload[2] = static_cast<std::uint8_t>((remain_valid_ms >> 8)  & 0xFF);
+    p.payload[3] = static_cast<std::uint8_t>((remain_valid_ms >> 16) & 0xFF);
+    p.payload[4] = static_cast<std::uint8_t>((remain_valid_ms >> 24) & 0xFF);
+    return p;
+}
+
 // Generic-commander HOVER setpoint (type 5). Wire layout:
 //   [type:1] [vx:f32 LE] [vy:f32 LE] [yaw_rate:f32 LE] [z_distance:f32 LE]
 // Body-frame velocity (m/s), yaw rate (deg/s), absolute target height
@@ -385,6 +405,219 @@ decode_log_settings_ack(const RawPacket& pkt) {
     }
     if (pkt.size < 3) return std::unexpected(DecodeError::Truncated);
     return LogSettingsAck{pkt.payload[0], pkt.payload[1], pkt.payload[2]};
+}
+
+// ---------------------------------------------------------------------------
+// PARAM TOC + WRITE — minimal support for setting a single named uint8_t
+// parameter. Same TOC command codes as LOG; element layout differs.
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] inline RawPacket make_param_toc_info_v2_request() noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortParam;
+    p.channel = crtp::kChannelParamToc;
+    p.size    = 1;
+    p.payload[0] = crtp::kCmdTocInfoV2;
+    return p;
+}
+
+[[nodiscard]] inline RawPacket
+make_param_toc_item_v2_request(std::uint16_t index) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortParam;
+    p.channel = crtp::kChannelParamToc;
+    p.size    = 3;
+    p.payload[0] = crtp::kCmdTocItemV2;
+    p.payload[1] = static_cast<std::uint8_t>(index & 0xFF);
+    p.payload[2] = static_cast<std::uint8_t>((index >> 8) & 0xFF);
+    return p;
+}
+
+// PARAM_WRITE_V2 for a uint8_t value. Wire layout:
+//   [var_id_lo] [var_id_hi] [value:1]
+// The firmware echoes the var_id back on the same channel as ack.
+[[nodiscard]] inline RawPacket
+make_param_write_uint8(std::uint16_t var_id, std::uint8_t value) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortParam;
+    p.channel = crtp::kChannelParamWrite;
+    p.size    = 3;
+    p.payload[0] = static_cast<std::uint8_t>(var_id & 0xFF);
+    p.payload[1] = static_cast<std::uint8_t>((var_id >> 8) & 0xFF);
+    p.payload[2] = value;
+    return p;
+}
+
+// CMD_TOC_INFO_V2 reply on the PARAM port — same shape as LOG version.
+[[nodiscard]] inline std::expected<ParamTocInfo, DecodeError>
+decode_param_toc_info_v2(const RawPacket& pkt) {
+    if (pkt.port != crtp::kPortParam ||
+        pkt.channel != crtp::kChannelParamToc) {
+        return std::unexpected(DecodeError::WrongPort);
+    }
+    if (pkt.size < 7) return std::unexpected(DecodeError::Truncated);
+    if (pkt.payload[0] != crtp::kCmdTocInfoV2) {
+        return std::unexpected(DecodeError::UnexpectedCmd);
+    }
+    ParamTocInfo info{};
+    info.count = static_cast<std::uint16_t>(
+        pkt.payload[1] | (pkt.payload[2] << 8));
+    info.crc =
+        static_cast<std::uint32_t>(pkt.payload[3]) |
+        (static_cast<std::uint32_t>(pkt.payload[4]) << 8) |
+        (static_cast<std::uint32_t>(pkt.payload[5]) << 16) |
+        (static_cast<std::uint32_t>(pkt.payload[6]) << 24);
+    return info;
+}
+
+// CMD_TOC_ITEM_V2 reply on the PARAM port. Layout:
+//   [cmd:1] [index:2 LE] [metadata:1] [group\0] [name\0]
+// Metadata's low nibble is the type, bit 4 is extended, bit 6 is read-only.
+[[nodiscard]] inline std::expected<ParamTocItem, DecodeError>
+decode_param_toc_item_v2(const RawPacket& pkt) {
+    if (pkt.port != crtp::kPortParam ||
+        pkt.channel != crtp::kChannelParamToc) {
+        return std::unexpected(DecodeError::WrongPort);
+    }
+    if (pkt.size < 4) return std::unexpected(DecodeError::Truncated);
+    if (pkt.payload[0] != crtp::kCmdTocItemV2) {
+        return std::unexpected(DecodeError::UnexpectedCmd);
+    }
+    ParamTocItem item{};
+    item.index = static_cast<std::uint16_t>(
+        pkt.payload[1] | (pkt.payload[2] << 8));
+    const std::uint8_t metadata = pkt.payload[3];
+    item.type_code = metadata & crtp::kParamTypeMaskCore;
+    item.read_only = (metadata & crtp::kParamTypeFlagReadonly) != 0;
+
+    std::size_t i = 4;
+    auto read_cstr = [&](std::string& out) -> bool {
+        const std::size_t start = i;
+        while (i < pkt.size && pkt.payload[i] != 0) ++i;
+        if (i >= pkt.size) return false;
+        out.assign(reinterpret_cast<const char*>(&pkt.payload[start]),
+                   i - start);
+        ++i;
+        return true;
+    };
+    if (!read_cstr(item.group)) return std::unexpected(DecodeError::Truncated);
+    if (!read_cstr(item.name))  return std::unexpected(DecodeError::Truncated);
+    return item;
+}
+
+// PARAM_WRITE response: the firmware echoes back the var_id on the WRITE
+// channel. We treat reception as success (cflib does the same — there's
+// no distinct "rejected" reply for V2 writes).
+[[nodiscard]] inline bool
+is_param_write_ack(const RawPacket& pkt, std::uint16_t expected_var_id) noexcept {
+    if (pkt.port != crtp::kPortParam ||
+        pkt.channel != crtp::kChannelParamWrite ||
+        pkt.size < 2) {
+        return false;
+    }
+    const std::uint16_t got = static_cast<std::uint16_t>(
+        pkt.payload[0] | (pkt.payload[1] << 8));
+    return got == expected_var_id;
+}
+
+// ---------------------------------------------------------------------------
+// High-level commander LAND. Wire format:
+//   [opcode:1=0x08] [group_mask:1] [height:f32 LE] [yaw:f32 LE]
+//   [use_current_yaw:1] [duration:f32 LE]
+// Total: 15 bytes.
+// ---------------------------------------------------------------------------
+
+// Internal helper — write a little-endian float at the given offset of a
+// RawPacket payload. Used by the HLC builders below.
+inline void hlc_write_f32(RawPacket& p, std::size_t off, float v) noexcept {
+    std::uint32_t bits;
+    std::memcpy(&bits, &v, 4);
+    p.payload[off + 0] = static_cast<std::uint8_t>(bits & 0xFF);
+    p.payload[off + 1] = static_cast<std::uint8_t>((bits >> 8) & 0xFF);
+    p.payload[off + 2] = static_cast<std::uint8_t>((bits >> 16) & 0xFF);
+    p.payload[off + 3] = static_cast<std::uint8_t>((bits >> 24) & 0xFF);
+}
+
+[[nodiscard]] inline RawPacket
+make_hlc_land(float height_m, float duration_s,
+              bool use_current_yaw = true,
+              float yaw_rad = 0.0f,
+              std::uint8_t group_mask = 0) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortHighLevelCmd;
+    p.channel = crtp::kChannelHighLevelCmd;
+    p.size    = 15;
+    p.payload[0] = crtp::kCmdHlcLand2;
+    p.payload[1] = group_mask;
+    hlc_write_f32(p, 2,  height_m);
+    hlc_write_f32(p, 6,  yaw_rad);
+    p.payload[10] = use_current_yaw ? std::uint8_t{1} : std::uint8_t{0};
+    hlc_write_f32(p, 11, duration_s);
+    return p;
+}
+
+// HLC STOP (cflib COMMAND_STOP). 2-byte payload:
+//   [opcode:1=0x03] [group_mask:1]
+// Cuts the high-level commander cleanly. cflib uses this — not
+// setpoint_stop — at end of HLC missions. Mixing low-level disarm with
+// HLC trajectories is what triggers the firmware's `is_locked` latch.
+[[nodiscard]] inline RawPacket
+make_hlc_stop(std::uint8_t group_mask = 0) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortHighLevelCmd;
+    p.channel = crtp::kChannelHighLevelCmd;
+    p.size    = 2;
+    p.payload[0] = crtp::kCmdHlcStop;
+    p.payload[1] = group_mask;
+    return p;
+}
+
+// HLC TAKEOFF (cflib COMMAND_TAKEOFF_2). Same 15-byte layout as LAND, only
+// the opcode differs. Drone climbs from current position to absolute
+// `height_m` over `duration_s`, then HLC holds the new position.
+[[nodiscard]] inline RawPacket
+make_hlc_takeoff(float height_m, float duration_s,
+                 bool use_current_yaw = true,
+                 float yaw_rad = 0.0f,
+                 std::uint8_t group_mask = 0) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortHighLevelCmd;
+    p.channel = crtp::kChannelHighLevelCmd;
+    p.size    = 15;
+    p.payload[0] = crtp::kCmdHlcTakeoff2;
+    p.payload[1] = group_mask;
+    hlc_write_f32(p, 2,  height_m);
+    hlc_write_f32(p, 6,  yaw_rad);
+    p.payload[10] = use_current_yaw ? std::uint8_t{1} : std::uint8_t{0};
+    hlc_write_f32(p, 11, duration_s);
+    return p;
+}
+
+// HLC GO_TO (cflib COMMAND_GO_TO_2). 24-byte payload:
+//   [opcode:1=0x0C] [group_mask:1] [relative:1] [linear:1]
+//   [x:f32] [y:f32] [z:f32] [yaw:f32] [duration:f32]
+// `relative=true` makes (x, y, z, yaw) deltas from the current state;
+// `relative=false` treats them as absolute targets. `linear=false` lets
+// the firmware planner generate a smooth polynomial trajectory; setting
+// it true skips the planner and drives a straight-line motion.
+[[nodiscard]] inline RawPacket
+make_hlc_go_to(float x, float y, float z, float yaw_rad, float duration_s,
+               bool relative = true, bool linear = false,
+               std::uint8_t group_mask = 0) noexcept {
+    RawPacket p{};
+    p.port    = crtp::kPortHighLevelCmd;
+    p.channel = crtp::kChannelHighLevelCmd;
+    p.size    = 24;
+    p.payload[0] = crtp::kCmdHlcGoTo2;
+    p.payload[1] = group_mask;
+    p.payload[2] = relative ? std::uint8_t{1} : std::uint8_t{0};
+    p.payload[3] = linear   ? std::uint8_t{1} : std::uint8_t{0};
+    hlc_write_f32(p, 4,  x);
+    hlc_write_f32(p, 8,  y);
+    hlc_write_f32(p, 12, z);
+    hlc_write_f32(p, 16, yaw_rad);
+    hlc_write_f32(p, 20, duration_s);
+    return p;
 }
 
 // ---------------------------------------------------------------------------
