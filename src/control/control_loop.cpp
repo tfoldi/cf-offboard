@@ -76,7 +76,8 @@ void run_control_loop(ICrazyflieLink& link,
                       MCAPLogger& logger,
                       const ControlLoopConfig& cfg,
                       std::atomic<bool>& shutdown_requested,
-                      MissionStateCallback on_state_change) {
+                      MissionStateCallback on_state_change,
+                      SetpointCallback     on_setpoint) {
     using clock = std::chrono::steady_clock;
 
     MissionContext ctx{};
@@ -114,7 +115,7 @@ void run_control_loop(ICrazyflieLink& link,
             logger.log(MissionStateEvent{
                 ctx.state, ctx.abort_reason, ctx.abort_detail, t_host});
             if (on_state_change) {
-                on_state_change(ctx.state, ctx.abort_reason);
+                on_state_change(ctx.state, ctx.abort_reason, ctx.abort_detail);
             }
         }
 
@@ -131,6 +132,7 @@ void run_control_loop(ICrazyflieLink& link,
         }
         if (auto ev = to_event(out.command, t_host)) {
             logger.log(*ev);
+            if (on_setpoint) on_setpoint(*ev);
         }
 
         if (out.terminate) {

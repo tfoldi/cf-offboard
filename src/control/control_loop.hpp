@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <functional>
+#include <string_view>
 
 namespace cfo {
 
@@ -30,7 +31,13 @@ namespace cfo {
 // mission_tick state transition — used by the app to push the change into
 // AppStatusStore so the TUI sees it. May be nullptr.
 using MissionStateCallback =
-    std::function<void(MissionState, AbortReason)>;
+    std::function<void(MissionState, AbortReason, std::string_view detail)>;
+
+// `on_setpoint` (optional) is invoked from the control thread for every
+// emitted Stop/Hover SetpointCommandEvent — used to mirror the same event
+// stream into Rerun. May be nullptr.
+using SetpointCallback =
+    std::function<void(const SetpointCommandEvent&)>;
 
 void run_control_loop(ICrazyflieLink& link,
                       const StateStore& state,
@@ -38,6 +45,7 @@ void run_control_loop(ICrazyflieLink& link,
                       MCAPLogger& logger,
                       const ControlLoopConfig& cfg,
                       std::atomic<bool>& shutdown_requested,
-                      MissionStateCallback on_state_change = nullptr);
+                      MissionStateCallback on_state_change = nullptr,
+                      SetpointCallback     on_setpoint     = nullptr);
 
 } // namespace cfo

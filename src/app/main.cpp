@@ -17,6 +17,9 @@
 #include "state/types.hpp"
 #include "ui/tui.hpp"
 #include "ui/types.hpp"
+#ifdef CFO_HAS_RERUN
+#include "rerun_sink/rerun_sink.hpp"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -84,6 +87,8 @@ struct CliArgs {
     std::optional<std::string> mcap_path;
     std::optional<std::string> console_log_path;
     bool force_headless{false};
+    bool rerun_enabled{true};       // default on; off skips RerunSink::create
+    bool rerun_connect{false};      // connect to existing viewer instead of spawning
 };
 
 CliArgs parse_args(int argc, char** argv) {
@@ -96,6 +101,10 @@ CliArgs parse_args(int argc, char** argv) {
             a.console_log_path = std::string{argv[++i]};
         } else if (s == "--no-console-log") {
             a.console_log_path = std::string{};   // explicit disable
+        } else if (s == "--no-rerun") {
+            a.rerun_enabled = false;
+        } else if (s == "--rerun-connect") {
+            a.rerun_connect = true;
         } else if (!a.uri) {
             a.uri = std::string{s};
         } else if (!a.mcap_path) {
@@ -186,6 +195,28 @@ int main(int argc, char** argv) {
     auto& logger = **logger_r;
     app_status.update([](cfo::AppStatus& s) { s.log_active = true; });
     cfo::console::info("MCAP recording started: {}", cfg.mcap_path.string());
+
+    // ----- Rerun sink (best-effort) ----------------------------------------
+    // RERUN.md: Rerun is a live visualization sink fed from the same
+    // semantic model as MCAP. Failure to connect/spawn must not block the
+    // flight; we just continue with rerun_sink == nullptr.
+#ifdef CFO_HAS_RERUN
+    std::unique_ptr<cfo::RerunSink> rerun_sink;
+    if (cli.rerun_enabled) {
+        const auto mode = cli.rerun_connect ? cfo::RerunSink::Mode::Connect
+                                            : cfo::RerunSink::Mode::Spawn;
+        auto rs = cfo::RerunSink::create("cf-offboard", mode);
+        if (rs) {
+            rerun_sink = std::move(*rs);
+            cfo::console::info("rerun: visualization sink {}",
+                               cli.rerun_connect ? "connected" : "spawned");
+        } else {
+            cfo::console::warn("rerun: disabled — {}", rs.error());
+        }
+    } else {
+        cfo::console::info("rerun: disabled by --no-rerun");
+    }
+#endif
 
     auto link_r = cfo::open_crazyflie_link(cfg.crazyflie_uri);
     if (!link_r) {
@@ -381,6 +412,15 @@ int main(int argc, char** argv) {
                         state.apply(cfo::pose_from_log_sample(s, t_steady));
                         state.apply(cfo::battery_from_log_sample(s, t_steady));
 
+#ifdef CFO_HAS_RERUN
+                        if (rerun_sink) {
+                            const auto vs = state.snapshot();
+                            rerun_sink->log_vehicle(vs);
+                            rerun_sink->log_battery(vs.battery_voltage);
+                            rerun_sink->log_altitude(vs.position.z);
+                        }
+#endif
+
                         ++log_samples;
                         if (log_samples == 1) {
                             cfo::console::info(
@@ -407,6 +447,12 @@ int main(int argc, char** argv) {
 
                         logger.log(cfo::RangeBlockEvent{snap, t});
 
+#ifdef CFO_HAS_RERUN
+                        if (rerun_sink) {
+                            rerun_sink->log_ranges(snap);
+                        }
+#endif
+
                         // Project each ray into odom and stash + log.
                         const auto v = state.snapshot();
                         const auto rays = cfo::rays_from_snapshot(snap);
@@ -416,6 +462,9 @@ int main(int argc, char** argv) {
                             if (!pt_opt) continue;
                             obstacle_store.push(*pt_opt);
                             logger.log(cfo::ObstaclePointEvent{*pt_opt, t});
+#ifdef CFO_HAS_RERUN
+                            if (rerun_sink) rerun_sink->log_obstacle_point(*pt_opt);
+#endif
                         }
                         obstacle_store.prune(t_steady);
 
@@ -613,14 +662,30 @@ int main(int argc, char** argv) {
             std::thread control_thread{[&] {
                 cfo::run_control_loop(
                     link, state, app_status, logger, ctrl_cfg, control_shutdown,
-                    [&](cfo::MissionState ms, cfo::AbortReason ar) {
+                    [&](cfo::MissionState ms, cfo::AbortReason ar,
+                        std::string_view detail) {
                         app_status.update([&](cfo::AppStatus& s) {
                             s.mission_state = ms;
                             if (ar != cfo::AbortReason::None) {
                                 s.last_abort_reason = ar;
                             }
                         });
-                    });
+#ifdef CFO_HAS_RERUN
+                        if (rerun_sink) {
+                            rerun_sink->log_mission_state(ms, ar, detail);
+                        }
+#endif
+                    },
+#ifdef CFO_HAS_RERUN
+                    [&](const cfo::SetpointCommandEvent& ev) {
+                        if (rerun_sink) {
+                            rerun_sink->log_setpoint(ev, state.snapshot());
+                        }
+                    }
+#else
+                    nullptr
+#endif
+                );
             }};
 
             std::thread mission_watchdog{[&] {

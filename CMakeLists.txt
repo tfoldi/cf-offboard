@@ -102,6 +102,52 @@ add_library(doctest_headers INTERFACE)
 target_include_directories(doctest_headers INTERFACE "${_doctest_vendor_dir}")
 
 # ----------------------------------------------------------------------------
+# Rerun C++ SDK — optional live visualization sink. MCAP remains the
+# canonical persisted record (see RERUN.md); Rerun is a best-effort
+# visualization layer that does not affect flight behaviour. Disable
+# with -DCFOFFBOARD_RERUN=OFF if you don't have network at configure
+# time or want to skip the dependency entirely.
+# ----------------------------------------------------------------------------
+
+option(CFOFFBOARD_RERUN "Build with Rerun SDK for live visualization" ON)
+if(CFOFFBOARD_RERUN)
+    include(FetchContent)
+    FetchContent_Declare(rerun_sdk
+        URL https://github.com/rerun-io/rerun/releases/download/0.31.3/rerun_cpp_sdk.zip)
+
+    # The Rerun SDK builds Arrow as an ExternalProject without propagating
+    # the parent project's compiler/flags, so on Linux Arrow gets compiled
+    # with the system GCC + libstdc++ while the rest of cf-offboard uses
+    # clang + libc++ (needed for std::expected on this toolchain). The
+    # static libarrow.a then drags libstdc++ symbols into the final link,
+    # breaking linkage with libc++.
+    #
+    # Patch download_and_build_arrow.cmake in-place to:
+    #   1. propagate parent CMAKE_C/CXX_COMPILER into Arrow's CMAKE_ARGS
+    #   2. set ARROW_CXXFLAGS to the parent's CMAKE_CXX_FLAGS (Arrow's
+    #      build appends this to its compile lines)
+    FetchContent_GetProperties(rerun_sdk)
+    if(NOT rerun_sdk_POPULATED)
+        FetchContent_Populate(rerun_sdk)
+        set(_arrow_cmake "${rerun_sdk_SOURCE_DIR}/download_and_build_arrow.cmake")
+        file(READ "${_arrow_cmake}" _arrow_orig)
+        if(NOT _arrow_orig MATCHES "CFOFFBOARD_PATCH_MARKER")
+            string(REPLACE
+                "set(ARROW_CXXFLAGS \"\")"
+                "set(ARROW_CXXFLAGS \"${CMAKE_CXX_FLAGS}\") # CFOFFBOARD_PATCH_MARKER"
+                _arrow_patched "${_arrow_orig}")
+            string(REPLACE
+                "CMAKE_ARGS\n        --preset \${ARROW_CMAKE_PRESET}"
+                "CMAKE_ARGS\n        -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}\n        -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}\n        -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}\n        -DCMAKE_EXE_LINKER_FLAGS=${CMAKE_CXX_FLAGS}\n        -DCMAKE_SHARED_LINKER_FLAGS=${CMAKE_CXX_FLAGS}\n        --preset \${ARROW_CMAKE_PRESET}"
+                _arrow_patched "${_arrow_patched}")
+            file(WRITE "${_arrow_cmake}" "${_arrow_patched}")
+            message(STATUS "Patched rerun arrow build to use parent compiler + flags")
+        endif()
+        add_subdirectory(${rerun_sdk_SOURCE_DIR} ${rerun_sdk_BINARY_DIR})
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
 # State — value types + thread-safe StateStore. No vendor dependencies.
 # ----------------------------------------------------------------------------
 
@@ -199,11 +245,28 @@ add_library(cfo_logging STATIC
 )
 target_include_directories(cfo_logging PUBLIC ${_cfo_src})
 target_link_libraries(cfo_logging
-    PUBLIC  cfo_link cfo_safety cfo_state cfo_mission
+    PUBLIC  cfo_link cfo_safety cfo_state cfo_mission cfo_perception
     PRIVATE mcap_headers Threads::Threads)
 # cfo_logging includes <ui/types.hpp> for EventLog, but those are header-only
 # value types — no link-time symbols needed. Include path is already covered
 # by the `_cfo_src` PUBLIC directory above.
+
+# ----------------------------------------------------------------------------
+# Rerun sink (optional). MCAP stays the canonical persisted record; this
+# is a live visualization sink fed from the same semantic model. Its
+# header is the only place the rerun SDK is referenced.
+# ----------------------------------------------------------------------------
+
+if(CFOFFBOARD_RERUN)
+    add_library(cfo_rerun_sink STATIC
+        src/rerun_sink/rerun_sink.cpp
+    )
+    target_include_directories(cfo_rerun_sink PUBLIC ${_cfo_src})
+    target_link_libraries(cfo_rerun_sink
+        PUBLIC  cfo_state cfo_perception cfo_safety cfo_mission cfo_logging
+        PRIVATE rerun_sdk)
+    target_compile_definitions(cfo_rerun_sink PUBLIC CFO_HAS_RERUN)
+endif()
 
 # ----------------------------------------------------------------------------
 # Control loop — fixed-rate setpoint streamer for slice (a)'s hover demo.
@@ -229,6 +292,9 @@ target_link_libraries(cf-offboard PRIVATE
     cfo_link cfo_log cfo_param cfo_logging cfo_state
     cfo_control cfo_safety cfo_mission cfo_perception cfo_ui
     Threads::Threads)
+if(CFOFFBOARD_RERUN)
+    target_link_libraries(cf-offboard PRIVATE cfo_rerun_sink)
+endif()
 
 # ----------------------------------------------------------------------------
 # Offline tools — debugging and analysis utilities. Self-contained; do not
