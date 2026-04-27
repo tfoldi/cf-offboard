@@ -201,10 +201,11 @@ target_link_libraries(cfo_logging
 
 add_library(cfo_control STATIC
     src/control/control_loop.cpp
+    src/control/manual_hlc.cpp
 )
 target_include_directories(cfo_control PUBLIC ${_cfo_src})
 target_link_libraries(cfo_control
-    PUBLIC  cfo_link cfo_state cfo_safety cfo_mission cfo_logging
+    PUBLIC  cfo_link cfo_state cfo_safety cfo_mission cfo_logging cfo_ui
     PRIVATE Threads::Threads)
 
 # ----------------------------------------------------------------------------
@@ -247,8 +248,10 @@ add_executable(cfo_tests
     tests/test_setpoint.cpp
     tests/test_safety.cpp
     tests/test_mission.cpp
+    tests/test_manual_hlc.cpp
 )
 target_include_directories(cfo_tests PRIVATE ${_cfo_src})
 target_link_libraries(cfo_tests PRIVATE
-    cfo_link cfo_log cfo_state cfo_safety cfo_mission cfo_control doctest_headers)
+    cfo_link cfo_log cfo_state cfo_safety cfo_mission cfo_control cfo_ui
+    doctest_headers)
 add_test(NAME cfo_tests COMMAND cfo_tests)

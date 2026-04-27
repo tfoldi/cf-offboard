@@ -1,0 +1,112 @@
+Implement the next perception and mission slice for cf-offboard using the Multiranger deck.
+
+Use these documents as design authority:
+- PERCEPTION.md
+- MISSION_OBSTACLE_FORWARD.md
+- RERUN.md
+
+Core intent:
+- Multiranger is now the next priority, ahead of AI Deck
+- the next target is local obstacle awareness and conservative obstacle-aware forward flight
+- Rerun should become useful now for live spatial visibility
+
+--------------------------------
+PRIORITY ORDER
+--------------------------------
+
+1. Multiranger telemetry integration
+2. local obstacle representation
+3. Rerun spatial visualization
+4. obstacle-aware forward mission
+5. AI Deck later
+
+Do not jump to camera integration first.
+
+--------------------------------
+IMPLEMENTATION SCOPE
+--------------------------------
+
+Implement a narrow first slice:
+
+1. Multiranger ingestion
+   - decode and expose front/back/left/right/up ranges
+   - add typed perception-facing range data
+   - log to MCAP
+   - show concise summary in TUI
+
+2. Local obstacle projection
+   - represent range rays in base_link
+   - project valid obstacle points into odom using current vehicle pose
+   - maintain a short-lived rolling obstacle view
+   - do not implement global mapping or SLAM
+
+3. Rerun integration update
+   - log vehicle transform in odom
+   - log Multiranger rays
+   - log projected obstacle points
+   - update default blueprint for this use case
+   - keep MCAP as the canonical persisted record
+
+4. Mission: obstacle-aware forward motion
+   - HLC-based mission
+   - bounded forward progress
+   - before each step, check obstacle state
+   - if blocked, stop/hold and abort or land safely
+   - keep behavior conservative and explicit
+
+--------------------------------
+DESIGN RULES
+--------------------------------
+
+- no generic perception framework
+- no internal pub/sub
+- no TF framework
+- no global map persistence
+- no path planner
+- no behavior tree
+- no camera coupling in this slice
+
+Prefer:
+- plain structs
+- explicit frame handling
+- freshness checks
+- short-lived local obstacle state
+- conservative mission logic
+
+--------------------------------
+RERUN RULES
+--------------------------------
+
+- do not make Rerun a second persisted log format
+- do not write .rrd by default
+- Rerun is a live visualization sink fed from the same semantic event/state model as MCAP
+- Rerun must be best-effort and non-blocking
+
+For the first useful Rerun view, include:
+- odom -> base_link transform
+- actual and commanded paths
+- Multiranger rays
+- projected obstacle points
+- mission state annotations
+
+--------------------------------
+MISSION RULES
+--------------------------------
+
+The first obstacle-aware behavior should be conservative.
+
+Preferred v1 behavior:
+- take off
+- move forward in small bounded steps
+- if forward path is blocked, stop and hover
+- then abort or land safely
+
+Do not implement sidestepping or rerouting in the first slice unless the simpler stop-and-hold version is already complete and clean.
+
+--------------------------------
+OUTPUT EXPECTATION
+--------------------------------
+
+Produce concrete code, not a framework.
+Keep the slice small and directly useful.
+If a design choice introduces hidden complexity, simplify it.

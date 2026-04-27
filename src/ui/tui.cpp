@@ -69,6 +69,12 @@ public:
         const int flags = ::fcntl(STDIN_FILENO, F_GETFL);
         ::fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
+        // Drain anything that was sitting in stdin before raw mode kicked
+        // in (shell echo, paste buffer, type-ahead). Otherwise the TUI's
+        // first poll would interpret it as keystrokes.
+        char drain_buf[256];
+        while (::read(STDIN_FILENO, drain_buf, sizeof(drain_buf)) > 0) {}
+
         write_raw(kAltScreenOn);
         write_raw(kHideCursor);
         write_raw(kClearScreen);
@@ -184,26 +190,45 @@ void paint_status(const AppStatus& s, int& row) {
                 s.mcap_path.c_str(), kReset.data(), kClearToEol.data());
 
     cursor_to(row++, 1);
-    const char* mcolor = (s.mission_state == MissionState::Aborted)
-                             ? kFgRed.data()
-                         : (s.mission_state == MissionState::Completed)
-                             ? kFgGreen.data()
-                         : s.mission_active ? kFgYellow.data()
-                                            : kFgCyan.data();
-    std::printf(" mission: %s%s%s%s%s",
-                mcolor, state_name(s.mission_state), kReset.data(),
-                s.last_abort_reason != AbortReason::None
-                    ? (std::string{"  ("} + abort_str(s.last_abort_reason) + ")").c_str()
-                    : "",
-                kClearToEol.data());
+    const char* mode_color =
+        (s.mode == AppMode::Mission)   ? kFgYellow.data() :
+        (s.mode == AppMode::ManualHlc) ? kFgCyan.data()   : kFgGray.data();
+    if (s.mode == AppMode::Mission) {
+        std::printf(" mode:    %s%s%s — %s%s",
+                    mode_color, mode_name(s.mode), kReset.data(),
+                    state_name(s.mission_state),
+                    kClearToEol.data());
+    } else if (s.mode == AppMode::ManualHlc) {
+        std::printf(" mode:    %s%s%s — %s%s",
+                    mode_color, mode_name(s.mode), kReset.data(),
+                    manual_state_name(s.manual_state),
+                    kClearToEol.data());
+    } else {
+        std::printf(" mode:    %s%s%s%s",
+                    mode_color, mode_name(s.mode), kReset.data(),
+                    kClearToEol.data());
+    }
+
+    if (s.last_abort_reason != AbortReason::None) {
+        cursor_to(row++, 1);
+        std::printf(" last:    %s%s%s%s",
+                    kFgRed.data(), abort_str(s.last_abort_reason),
+                    kReset.data(), kClearToEol.data());
+    }
 
     cursor_to(row++, 1);
     const char* ready_color =
         s.ready_to_fly ? kFgGreen.data() : kFgYellow.data();
-    const char* ready_label =
-        s.ready_to_fly ? (s.mission_active ? "mission active"
-                                           : "ready — press [s] to start")
-                       : "preparing…";
+    const char* ready_label;
+    if (!s.ready_to_fly) {
+        ready_label = "preparing…";
+    } else if (s.mission_active) {
+        ready_label = "mission active";
+    } else if (s.mode == AppMode::ManualHlc) {
+        ready_label = "manual mode";
+    } else {
+        ready_label = "ready — [s] mission, [m] manual";
+    }
     std::printf(" ready:   %s%s%s%s",
                 ready_color, ready_label, kReset.data(), kClearToEol.data());
 }
@@ -219,29 +244,30 @@ void paint_status(const AppStatus& s, int& row) {
 void paint_glyph(const VehicleState& v, const AppStatus& s,
                  int row, int col) {
     char center;
-    switch (s.mission_state) {
-        case MissionState::Aborted:   center = '!'; break;
-        case MissionState::Completed: center = '='; break;
-        default:
-            if (s.mission_active) {
-                // While flying, encode dominant attitude into the centre.
-                const float roll  = rad_to_deg(v.attitude.roll);
-                const float pitch = rad_to_deg(v.attitude.pitch);
-                constexpr float kThr = 5.0f;
-                if (std::fabs(roll) > std::fabs(pitch)) {
-                    if      (roll >  kThr) center = '>';
-                    else if (roll < -kThr) center = '<';
-                    else                   center = '*';
-                } else {
-                    if      (pitch >  kThr) center = '^';
-                    else if (pitch < -kThr) center = 'v';
-                    else                    center = '*';
-                }
-            } else if (s.ready_to_fly) {
-                center = 'X';
-            } else {
-                center = '+';
-            }
+    if (s.mode == AppMode::Mission &&
+        s.mission_state == MissionState::Aborted) {
+        center = '!';
+    } else if (s.mode == AppMode::Mission &&
+               s.mission_state == MissionState::Completed) {
+        center = '=';
+    } else if (is_airborne(s)) {
+        // While flying — manual or mission — encode dominant attitude.
+        const float roll  = rad_to_deg(v.attitude.roll);
+        const float pitch = rad_to_deg(v.attitude.pitch);
+        constexpr float kThr = 5.0f;
+        if (std::fabs(roll) > std::fabs(pitch)) {
+            if      (roll >  kThr) center = '>';
+            else if (roll < -kThr) center = '<';
+            else                   center = '*';
+        } else {
+            if      (pitch >  kThr) center = '^';
+            else if (pitch < -kThr) center = 'v';
+            else                    center = '*';
+        }
+    } else if (s.ready_to_fly) {
+        center = 'X';
+    } else {
+        center = '+';
     }
 
     const bool fresh = v.update_count > 0;
@@ -333,23 +359,71 @@ void paint_footer(const AppStatus& s, int row) {
         std::printf("%s[a]%s abort   %s[q]%s quit (refused while flying)%s",
                     kBold.data(), kReset.data(), kFgGray.data(), kReset.data(),
                     kClearToEol.data());
-    } else if (s.ready_to_fly) {
-        // Pre-arm checks passed and no mission is running. 's' starts a
-        // new mission whether or not a previous one already ran.
+        return;
+    }
+    if (s.mode == AppMode::ManualHlc) {
+        switch (s.manual_state) {
+            case ManualState::OnGround:
+                std::printf("%s[t]%s takeoff   %s[m]%s exit manual   "
+                            "%s[q]%s quit%s",
+                            kBold.data(), kReset.data(),
+                            kBold.data(), kReset.data(),
+                            kBold.data(), kReset.data(),
+                            kClearToEol.data());
+                break;
+            case ManualState::TakingOff:
+                std::printf("%staking off…%s   %s[a]%s abort%s",
+                            kFgYellow.data(), kReset.data(),
+                            kBold.data(), kReset.data(),
+                            kClearToEol.data());
+                break;
+            case ManualState::Flying:
+                std::printf(
+                    "%sw/a/s/d%s move   %s[q/e]%s yaw   %s[r/f]%s up/down"
+                    "   %s[l]%s land   %s[x]%s abort   %s[m]%s exit%s",
+                    kBold.data(), kReset.data(),
+                    kBold.data(), kReset.data(),
+                    kBold.data(), kReset.data(),
+                    kBold.data(), kReset.data(),
+                    kBold.data(), kReset.data(),
+                    kBold.data(), kReset.data(),
+                    kClearToEol.data());
+                break;
+            case ManualState::Landing:
+                std::printf("%slanding…%s%s",
+                            kFgYellow.data(), kReset.data(),
+                            kClearToEol.data());
+                break;
+        }
+        return;
+    }
+    if (s.ready_to_fly) {
         const char* hint =
             (s.mission_state == MissionState::Completed) ? " (new)"  :
             (s.mission_state == MissionState::Aborted)   ? " (retry)":
             "";
-        std::printf("%s[s]%s start%s   %s[q]%s quit%s",
+        std::printf("%s[s]%s start%s   %s[m]%s manual mode   "
+                    "%s[q]%s quit%s",
                     kBold.data(), kReset.data(), hint,
-                    kBold.data(), kReset.data(), kClearToEol.data());
-    } else {
-        std::printf("%s[q]%s quit (forces shutdown)%s",
-                    kBold.data(), kReset.data(), kClearToEol.data());
+                    kBold.data(), kReset.data(),
+                    kBold.data(), kReset.data(),
+                    kClearToEol.data());
+        return;
     }
+    std::printf("%s[q]%s quit (forces shutdown)%s",
+                kBold.data(), kReset.data(), kClearToEol.data());
 }
 
 // ---- input handling ---------------------------------------------------------
+
+// Direction step intents — only fire while in ManualHlc.Flying.
+void try_step(OperatorIntents& intents, const AppStatus& s,
+              ManualStep step) {
+    if (s.mode == AppMode::ManualHlc &&
+        s.manual_state == ManualState::Flying) {
+        intents.manual_step.store(step, std::memory_order_release);
+    }
+}
 
 void handle_keys(OperatorIntents& intents, AppStatusStore& mutable_status,
                  std::atomic<bool>& shutdown) {
@@ -357,45 +431,124 @@ void handle_keys(OperatorIntents& intents, AppStatusStore& mutable_status,
     while (true) {
         const ssize_t n = ::read(STDIN_FILENO, buf, sizeof(buf));
         if (n <= 0) return;
-        for (ssize_t i = 0; i < n; ++i) {
-            const char c = buf[i];
+
+        for (ssize_t i = 0; i < n; ) {
             const auto s = mutable_status.snapshot();
-            switch (c) {
-                case 'q':
-                case 'Q':
-                    if (!s.mission_active) {
-                        intents.quit.store(true, std::memory_order_release);
-                        shutdown.store(true, std::memory_order_release);
+
+            // Arrow key escape sequences: ESC '[' (A|B|C|D).
+            if (i + 2 < n && buf[i] == 0x1B && buf[i + 1] == '[') {
+                const char arrow = buf[i + 2];
+                switch (arrow) {
+                    case 'A': try_step(intents, s, ManualStep::XPlus);  break;
+                    case 'B': try_step(intents, s, ManualStep::XMinus); break;
+                    case 'D': try_step(intents, s, ManualStep::YPlus);  break;
+                    case 'C': try_step(intents, s, ManualStep::YMinus); break;
+                    default: break;
+                }
+                i += 3;
+                continue;
+            }
+
+            const char c = buf[i++];
+            const bool airborne = is_airborne(s);
+            const bool manual_flying =
+                s.mode == AppMode::ManualHlc &&
+                s.manual_state == ManualState::Flying;
+
+            // Ctrl-C: always usable — quit when safe, abort mid-flight.
+            if (c == 0x03) {
+                if (!airborne) {
+                    intents.quit.store(true, std::memory_order_release);
+                    shutdown.store(true, std::memory_order_release);
+                } else {
+                    intents.abort_mission.store(
+                        true, std::memory_order_release);
+                }
+                continue;
+            }
+
+            // Letter keys are mode-overloaded: most chars mean one thing
+            // on the ground (mission start, quit, etc.) and movement once
+            // in manual flight. The footer reflects the active mapping.
+            if (manual_flying) {
+                    // FPS-style movement bindings while manually flying.
+                    switch (c) {
+                        case 'w': case 'W':
+                            try_step(intents, s, ManualStep::XPlus);  break;
+                        case 's': case 'S':
+                            try_step(intents, s, ManualStep::XMinus); break;
+                        case 'a': case 'A':
+                            try_step(intents, s, ManualStep::YPlus);  break;
+                        case 'd': case 'D':
+                            try_step(intents, s, ManualStep::YMinus); break;
+                        case 'r': case 'R':
+                            try_step(intents, s, ManualStep::ZPlus);  break;
+                        case 'f': case 'F':
+                            try_step(intents, s, ManualStep::ZMinus); break;
+                        case 'q': case 'Q':
+                            try_step(intents, s, ManualStep::YawPlus);  break;
+                        case 'e': case 'E':
+                            try_step(intents, s, ManualStep::YawMinus); break;
+                        case 'l': case 'L':
+                            intents.manual_land.store(
+                                true, std::memory_order_release);
+                            break;
+                        case 'm': case 'M':
+                            // Exit manual: auto-lands first if airborne.
+                            intents.exit_manual.store(
+                                true, std::memory_order_release);
+                            break;
+                        case 'x': case 'X':   // 'x' = abort while flying
+                            intents.abort_mission.store(
+                                true, std::memory_order_release);
+                            break;
+                        default: break;
                     }
-                    // else: refused; visible in footer
-                    break;
-                case 's':
-                case 'S':
-                    // Allow start whenever we're armed-and-ready and a
-                    // mission isn't already running. Past mission state
-                    // (Completed / Aborted) doesn't gate the next start.
-                    if (s.ready_to_fly && !s.mission_active) {
-                        intents.start_mission.store(true,
-                                                    std::memory_order_release);
-                    }
-                    break;
-                case 'a':
-                case 'A':
-                    if (s.mission_active) {
-                        intents.abort_mission.store(true,
-                                                    std::memory_order_release);
-                    }
-                    break;
-                case 0x03:  // ctrl-c — treat as quit-when-safe
-                    if (!s.mission_active) {
-                        shutdown.store(true, std::memory_order_release);
-                    } else {
-                        intents.abort_mission.store(true,
-                                                    std::memory_order_release);
-                    }
-                    break;
-                default:
-                    break;
+                    continue;
+                }
+
+                // Non-flying letter bindings.
+                switch (c) {
+                    case 'q': case 'Q':
+                        if (!airborne) {
+                            intents.quit.store(true, std::memory_order_release);
+                            shutdown.store(true, std::memory_order_release);
+                        }
+                        break;
+                    case 's': case 'S':
+                        if (s.mode == AppMode::Idle && s.ready_to_fly) {
+                            intents.start_mission.store(
+                                true, std::memory_order_release);
+                        }
+                        break;
+                    case 'm': case 'M':
+                        if (s.mode == AppMode::Idle && s.ready_to_fly) {
+                            intents.enter_manual.store(
+                                true, std::memory_order_release);
+                        } else if (s.mode == AppMode::ManualHlc) {
+                            // ManualHlc.OnGround / TakingOff / Landing —
+                            // 'm' requests exit (manual loop will auto-
+                            // land first if airborne).
+                            intents.exit_manual.store(
+                                true, std::memory_order_release);
+                        }
+                        break;
+                    case 't': case 'T':
+                        if (s.mode == AppMode::ManualHlc &&
+                            s.manual_state == ManualState::OnGround) {
+                            intents.manual_takeoff.store(
+                                true, std::memory_order_release);
+                        }
+                        break;
+                    case 'a': case 'A':
+                        // Abort in mission flying. (Manual flying handled
+                        // above; manual on ground has nothing to abort.)
+                        if (s.mission_active) {
+                            intents.abort_mission.store(
+                                true, std::memory_order_release);
+                        }
+                        break;
+                    default: break;
             }
         }
     }

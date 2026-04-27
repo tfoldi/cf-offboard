@@ -1,5 +1,6 @@
 #include "app/config.hpp"
 #include "control/control_loop.hpp"
+#include "control/manual_hlc.hpp"
 #include "control/types.hpp"
 #include "crazyflie/link/interfaces.hpp"
 #include "crazyflie/link/types.hpp"
@@ -408,6 +409,21 @@ int main(int argc, char** argv) {
     // on the same authority that just landed the vehicle. Mixing in a
     // low-level disarm here is what previously latched the supervisor
     // into is_locked between runs.
+
+    // Defensive: clear any mode-selection / per-mission intent that may
+    // have been left behind across iterations. `intents.quit` is preserved
+    // because it's app-wide and persistent by design.
+    auto clear_mode_intents = [&] {
+        intents.start_mission.store(false, std::memory_order_release);
+        intents.enter_manual.store(false, std::memory_order_release);
+        intents.exit_manual.store(false, std::memory_order_release);
+        intents.manual_takeoff.store(false, std::memory_order_release);
+        intents.manual_land.store(false, std::memory_order_release);
+        intents.manual_step.store(cfo::ManualStep::None,
+                                   std::memory_order_release);
+        intents.abort_mission.store(false, std::memory_order_release);
+    };
+
     if (ready_to_fly) {
         cfo::ControlLoopConfig ctrl_cfg{};
         const auto& m = ctrl_cfg.mission;
@@ -421,18 +437,54 @@ int main(int argc, char** argv) {
             m.hlc_land_duration.count());
 
         while (true) {
+            // Decide what the operator wants next: mission, manual, or quit.
+            // In headless mode we always run a single mission and exit.
+            bool want_mission = !tui_mode;
+            bool want_manual  = false;
             if (tui_mode) {
-                cfo::console::info("press [s] to start the mission");
+                clear_mode_intents();
+                cfo::console::info("press [s] mission, [m] manual, [q] quit");
                 using namespace std::chrono_literals;
                 while (!g_shutdown.load(std::memory_order_acquire) &&
                        !intents.quit.load(std::memory_order_acquire)) {
                     if (intents.start_mission.exchange(
-                            false, std::memory_order_acq_rel)) break;
+                            false, std::memory_order_acq_rel)) {
+                        want_mission = true;
+                        break;
+                    }
+                    if (intents.enter_manual.exchange(
+                            false, std::memory_order_acq_rel)) {
+                        want_manual = true;
+                        break;
+                    }
                     std::this_thread::sleep_for(20ms);
                 }
                 if (g_shutdown.load(std::memory_order_acquire) ||
                     intents.quit.load(std::memory_order_acquire)) break;
             }
+
+            // ----- ManualHlc branch ---------------------------------------
+            if (want_manual) {
+                app_status.update([](cfo::AppStatus& s) {
+                    s.mode = cfo::AppMode::ManualHlc;
+                    s.manual_state = cfo::ManualState::OnGround;
+                    s.last_abort_reason = cfo::AbortReason::None;
+                });
+                cfo::ManualHlcConfig man_cfg{};
+                cfo::run_manual_hlc(link, state, logger, app_status, intents,
+                                    man_cfg, g_shutdown);
+                app_status.update([](cfo::AppStatus& s) {
+                    s.mode = cfo::AppMode::Idle;
+                    s.manual_state = cfo::ManualState::OnGround;
+                });
+                continue;   // back to top — operator may choose mission next
+            }
+
+            // ----- Mission branch -----------------------------------------
+            if (!want_mission) continue;
+            app_status.update([](cfo::AppStatus& s) {
+                s.mode = cfo::AppMode::Mission;
+            });
 
             // Re-arm before each mission. HLC STOP at the end of the
             // previous mission disarmed the supervisor; the next HLC
@@ -500,6 +552,7 @@ int main(int argc, char** argv) {
 
             app_status.update([](cfo::AppStatus& s) {
                 s.mission_active = false;
+                s.mode = cfo::AppMode::Idle;
             });
 
             if (!tui_mode) break;   // headless: single mission per process
