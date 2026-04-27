@@ -128,6 +128,38 @@ constexpr std::string_view kSafetySchema = R"({
   "required":["reason"]
 })";
 
+constexpr std::string_view kRangeSchema = R"({
+  "type":"object",
+  "properties":{
+    "fw_t_ms":{"type":"integer"},
+    "front_m":{"type":"number"},"back_m":{"type":"number"},
+    "left_m":{"type":"number"}, "right_m":{"type":"number"},
+    "up_m":{"type":"number"},
+    "valid_front":{"type":"boolean"},"valid_back":{"type":"boolean"},
+    "valid_left":{"type":"boolean"}, "valid_right":{"type":"boolean"},
+    "valid_up":{"type":"boolean"}
+  },
+  "required":["fw_t_ms","front_m","back_m","left_m","right_m","up_m"]
+})";
+
+constexpr std::string_view kObstaclePointSchema = R"({
+  "type":"object",
+  "properties":{
+    "sensor":{"type":"string"},
+    "x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"}
+  },
+  "required":["sensor","x","y","z"]
+})";
+
+constexpr std::string_view kObstacleStatusSchema = R"({
+  "type":"object",
+  "properties":{
+    "status":{"type":"string","enum":["clear","caution","blocked"]},
+    "front_m":{"type":"number"}
+  },
+  "required":["status"]
+})";
+
 constexpr std::string_view kMissionSchema = R"({
   "type":"object",
   "properties":{
@@ -181,6 +213,9 @@ struct MCAPLogger::Impl {
     mcap::ChannelId safety_channel_id{0};
     mcap::ChannelId supervisor_channel_id{0};
     mcap::ChannelId mission_channel_id{0};
+    mcap::ChannelId range_channel_id{0};
+    mcap::ChannelId obstacle_pt_channel_id{0};
+    mcap::ChannelId obstacle_status_channel_id{0};
     std::uint32_t link_seq{0};
     std::uint32_t raw_seq{0};
     std::uint32_t cmd_seq{0};
@@ -190,6 +225,9 @@ struct MCAPLogger::Impl {
     std::uint32_t safety_seq{0};
     std::uint32_t supervisor_seq{0};
     std::uint32_t mission_seq{0};
+    std::uint32_t range_seq{0};
+    std::uint32_t obstacle_pt_seq{0};
+    std::uint32_t obstacle_status_seq{0};
 
     std::thread thread;
 
@@ -265,6 +303,46 @@ struct MCAPLogger::Impl {
                 e.vx_mps, e.vy_mps, e.yaw_rate_dps, e.z_target_m);
         }
         emit(setpoint_channel_id, ++setpoint_seq, e.t,
+             std::string{buf, static_cast<std::size_t>(n)});
+    }
+
+    void write_event(const RangeBlockEvent& e) {
+        char buf[300];
+        const auto& s = e.snapshot;
+        const int n = std::snprintf(
+            buf, sizeof(buf),
+            R"({"fw_t_ms":%u,)"
+            R"("front_m":%.3f,"back_m":%.3f,"left_m":%.3f,"right_m":%.3f,"up_m":%.3f,)"
+            R"("valid_front":%s,"valid_back":%s,"valid_left":%s,"valid_right":%s,"valid_up":%s})",
+            static_cast<unsigned>(s.fw_timestamp_ms),
+            s.front_m, s.back_m, s.left_m, s.right_m, s.up_m,
+            s.valid_front ? "true" : "false",
+            s.valid_back  ? "true" : "false",
+            s.valid_left  ? "true" : "false",
+            s.valid_right ? "true" : "false",
+            s.valid_up    ? "true" : "false");
+        emit(range_channel_id, ++range_seq, e.t,
+             std::string{buf, static_cast<std::size_t>(n)});
+    }
+
+    void write_event(const ObstaclePointEvent& e) {
+        char buf[160];
+        const int n = std::snprintf(
+            buf, sizeof(buf),
+            R"({"sensor":"%s","x":%.3f,"y":%.3f,"z":%.3f})",
+            range_sensor_name(e.point.sensor),
+            e.point.x, e.point.y, e.point.z);
+        emit(obstacle_pt_channel_id, ++obstacle_pt_seq, e.t,
+             std::string{buf, static_cast<std::size_t>(n)});
+    }
+
+    void write_event(const ObstacleStatusEvent& e) {
+        char buf[96];
+        const int n = std::snprintf(
+            buf, sizeof(buf),
+            R"({"status":"%s","front_m":%.3f})",
+            obstacle_status_name(e.status), e.front_m);
+        emit(obstacle_status_channel_id, ++obstacle_status_seq, e.t,
              std::string{buf, static_cast<std::size_t>(n)});
     }
 
@@ -431,6 +509,24 @@ MCAPLogger::create(std::filesystem::path path, std::size_t queue_capacity) {
     mcap::Channel mission_channel{"/mission/state", "json", mission_schema.id};
     impl->writer.addChannel(mission_channel);
     impl->mission_channel_id = mission_channel.id;
+
+    mcap::Schema range_schema{"cfo.Range", "jsonschema", kRangeSchema};
+    impl->writer.addSchema(range_schema);
+    mcap::Channel range_channel{"/perception/range", "json", range_schema.id};
+    impl->writer.addChannel(range_channel);
+    impl->range_channel_id = range_channel.id;
+
+    mcap::Schema obs_pt_schema{"cfo.ObstaclePoint", "jsonschema", kObstaclePointSchema};
+    impl->writer.addSchema(obs_pt_schema);
+    mcap::Channel obs_pt_channel{"/perception/obstacle_point", "json", obs_pt_schema.id};
+    impl->writer.addChannel(obs_pt_channel);
+    impl->obstacle_pt_channel_id = obs_pt_channel.id;
+
+    mcap::Schema obs_st_schema{"cfo.ObstacleStatus", "jsonschema", kObstacleStatusSchema};
+    impl->writer.addSchema(obs_st_schema);
+    mcap::Channel obs_st_channel{"/perception/obstacle_status", "json", obs_st_schema.id};
+    impl->writer.addChannel(obs_st_channel);
+    impl->obstacle_status_channel_id = obs_st_channel.id;
 
     auto* p = impl.get();
     impl->thread = std::thread{[p] { p->run(); }};

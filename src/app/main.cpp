@@ -11,6 +11,8 @@
 #include "logging/console.hpp"
 #include "logging/mcap_logger.hpp"
 #include "logging/types.hpp"
+#include "perception/perception.hpp"
+#include "perception/types.hpp"
 #include "state/state_store.hpp"
 #include "state/types.hpp"
 #include "ui/tui.hpp"
@@ -236,6 +238,34 @@ int main(int argc, char** argv) {
     }
     cfo::console::info("LOG: setup complete — telemetry active");
 
+    // ----- Multiranger range block (best-effort) -------------------------
+    // The deck is optional; if absent we proceed without obstacle data
+    // and the mission falls back to slice-5's clear-path behaviour.
+    cfo::RangeResolved range_resolved{};
+    {
+        auto pt = [&](const cfo::RawPacket& p) {
+            const auto t = std::chrono::system_clock::now();
+            logger.log(cfo::RawTelemetryEvent{p, t});
+        };
+        cfo::console::info("RANGE: probing for multiranger deck");
+        auto rr = cfo::setup_range_block(link, pt, log_setup_progress);
+        if (!rr) {
+            cfo::console::warn("RANGE: setup error: {} — proceeding without",
+                               rr.error().detail);
+        } else if (!rr->available) {
+            cfo::console::info("RANGE: no multiranger vars in TOC — deck absent");
+        } else {
+            range_resolved = *rr;
+            cfo::console::info(
+                "RANGE: ids front={} back={} left={} right={} up={}",
+                rr->front_id, rr->back_id, rr->left_id, rr->right_id,
+                rr->up_id);
+        }
+    }
+    app_status.update([&](cfo::AppStatus& s) {
+        s.perception_active = range_resolved.available;
+    });
+
     // ----- PARAM bring-up: enable the high-level commander ---------------
     // HLC defaults to 0 in firmware. Without this, HLC LAND is silently
     // dropped and the mission's landing phase doesn't happen.
@@ -313,11 +343,16 @@ int main(int argc, char** argv) {
 
     // ----- RX thread -------------------------------------------------------
     std::atomic<bool> first_sample_seen{false};
+    cfo::PerceptionConfig perc_cfg{};
+    cfo::ObstacleStore obstacle_store{perc_cfg};
+
     std::thread rx_thread{[&] {
         cfo::console::info("RX started (poll={}ms)", cfg.rx_poll_timeout.count());
         std::uint64_t log_samples = 0;
+        std::uint64_t range_samples = 0;
         constexpr std::uint64_t kRateWindow = 100;
         std::optional<std::chrono::steady_clock::time_point> rate_start;
+        cfo::ObstacleStatus prev_obstacle = cfo::ObstacleStatus::Clear;
 
         while (!g_shutdown.load(std::memory_order_relaxed)) {
             auto pkt = link.receive(cfg.rx_poll_timeout);
@@ -334,31 +369,89 @@ int main(int argc, char** argv) {
                     break;
 
                 case cfo::PacketKind::LogData: {
-                    auto sample_r = cfo::decode_log_block_sample(*pkt, cfo::kLogBlockId);
-                    if (!sample_r) break;
-                    const auto& s = *sample_r;
-                    logger.log(cfo::LogBlockEvent{s, t});
+                    // Distinguish the two blocks by block_id (first byte).
+                    const std::uint8_t block_id = pkt->payload[0];
+                    if (block_id == cfo::kLogBlockId) {
+                        auto sample_r = cfo::decode_log_block_sample(*pkt, cfo::kLogBlockId);
+                        if (!sample_r) break;
+                        const auto& s = *sample_r;
+                        logger.log(cfo::LogBlockEvent{s, t});
 
-                    const auto t_steady = std::chrono::steady_clock::now();
-                    state.apply(cfo::pose_from_log_sample(s, t_steady));
-                    state.apply(cfo::battery_from_log_sample(s, t_steady));
+                        const auto t_steady = std::chrono::steady_clock::now();
+                        state.apply(cfo::pose_from_log_sample(s, t_steady));
+                        state.apply(cfo::battery_from_log_sample(s, t_steady));
 
-                    ++log_samples;
-                    if (log_samples == 1) {
-                        cfo::console::info(
-                            "first state: pos=({:.2f},{:.2f},{:.2f}) "
-                            "att(deg)=({:.1f},{:.1f},{:.1f}) vbat={:.2f}V",
-                            s.x, s.y, s.z, s.roll, s.pitch, s.yaw, s.vbat);
-                        first_sample_seen.store(true, std::memory_order_release);
-                        rate_start = t_steady;
-                    } else if (log_samples % kRateWindow == 0) {
-                        const auto window =
-                            std::chrono::duration<double>(t_steady - *rate_start).count();
-                        const double hz = (window > 0.0) ? kRateWindow / window : 0.0;
-                        cfo::console::info(
-                            "state stream: {:.1f} Hz over last {} samples",
-                            hz, kRateWindow);
-                        rate_start = t_steady;
+                        ++log_samples;
+                        if (log_samples == 1) {
+                            cfo::console::info(
+                                "first state: pos=({:.2f},{:.2f},{:.2f}) "
+                                "att(deg)=({:.1f},{:.1f},{:.1f}) vbat={:.2f}V",
+                                s.x, s.y, s.z, s.roll, s.pitch, s.yaw, s.vbat);
+                            first_sample_seen.store(true, std::memory_order_release);
+                            rate_start = t_steady;
+                        } else if (log_samples % kRateWindow == 0) {
+                            const auto window =
+                                std::chrono::duration<double>(t_steady - *rate_start).count();
+                            const double hz = (window > 0.0) ? kRateWindow / window : 0.0;
+                            cfo::console::info(
+                                "state stream: {:.1f} Hz over last {} samples",
+                                hz, kRateWindow);
+                            rate_start = t_steady;
+                        }
+                    } else if (block_id == cfo::kRangeBlockId) {
+                        auto sample_r = cfo::decode_range_block_sample(*pkt, cfo::kRangeBlockId);
+                        if (!sample_r) break;
+                        const auto t_steady = std::chrono::steady_clock::now();
+                        const auto snap = cfo::make_range_snapshot(
+                            *sample_r, perc_cfg, t_steady, ++range_samples);
+
+                        logger.log(cfo::RangeBlockEvent{snap, t});
+
+                        // Project each ray into odom and stash + log.
+                        const auto v = state.snapshot();
+                        const auto rays = cfo::rays_from_snapshot(snap);
+                        for (const auto& ray : rays) {
+                            auto pt_opt = cfo::project_to_odom(
+                                ray, v, t_steady, perc_cfg);
+                            if (!pt_opt) continue;
+                            obstacle_store.push(*pt_opt);
+                            logger.log(cfo::ObstaclePointEvent{*pt_opt, t});
+                        }
+                        obstacle_store.prune(t_steady);
+
+                        // Update per-sensor + obstacle status in app status.
+                        const auto status = cfo::classify_forward(snap, perc_cfg);
+                        app_status.update([&](cfo::AppStatus& a) {
+                            a.front_m = snap.front_m;
+                            a.back_m  = snap.back_m;
+                            a.left_m  = snap.left_m;
+                            a.right_m = snap.right_m;
+                            a.up_m    = snap.up_m;
+                            a.valid_front = snap.valid_front;
+                            a.valid_back  = snap.valid_back;
+                            a.valid_left  = snap.valid_left;
+                            a.valid_right = snap.valid_right;
+                            a.valid_up    = snap.valid_up;
+                            a.obstacle_status = status;
+                            a.range_update_count = range_samples;
+                        });
+                        if (status != prev_obstacle) {
+                            if (snap.valid_front) {
+                                cfo::console::info(
+                                    "obstacle: {} → {} (front {:.2f}m)",
+                                    cfo::obstacle_status_name(prev_obstacle),
+                                    cfo::obstacle_status_name(status),
+                                    snap.front_m);
+                            } else {
+                                cfo::console::info(
+                                    "obstacle: {} → {} (front out-of-range)",
+                                    cfo::obstacle_status_name(prev_obstacle),
+                                    cfo::obstacle_status_name(status));
+                            }
+                            logger.log(cfo::ObstacleStatusEvent{
+                                status, snap.front_m, t});
+                            prev_obstacle = status;
+                        }
                     }
                     break;
                 }
@@ -370,7 +463,8 @@ int main(int argc, char** argv) {
                     break;
             }
         }
-        cfo::console::info("RX stopping ({} log samples decoded)", log_samples);
+        cfo::console::info("RX stopping ({} state, {} range samples)",
+                           log_samples, range_samples);
     }};
 
     // ----- watchdog: first sample within 3 s ------------------------------
@@ -428,12 +522,12 @@ int main(int argc, char** argv) {
         cfo::ControlLoopConfig ctrl_cfg{};
         const auto& m = ctrl_cfg.mission;
         cfo::console::info(
-            "mission: takeoff {:.2f}m, fwd {:.2f}m/s "
-            "(takeoff {}ms / hover {}ms / fwd {}ms / preland {}ms / "
+            "mission: takeoff {:.2f}m, fwd {}×{:.2f}m steps "
+            "(takeoff {}ms / hover {}ms / step {}ms / preland {}ms / "
             "hlc_land {}ms)",
-            m.target_height_m, m.forward_velocity_mps,
+            m.target_height_m, m.forward_max_steps, m.forward_step_m,
             m.takeoff_duration.count(), m.hover_duration.count(),
-            m.forward_duration.count(), m.preland_hover_duration.count(),
+            m.forward_step_duration.count(), m.preland_hover_duration.count(),
             m.hlc_land_duration.count());
 
         while (true) {
@@ -518,7 +612,7 @@ int main(int argc, char** argv) {
 
             std::thread control_thread{[&] {
                 cfo::run_control_loop(
-                    link, state, logger, ctrl_cfg, control_shutdown,
+                    link, state, app_status, logger, ctrl_cfg, control_shutdown,
                     [&](cfo::MissionState ms, cfo::AbortReason ar) {
                         app_status.update([&](cfo::AppStatus& s) {
                             s.mission_state = ms;

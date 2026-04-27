@@ -33,6 +33,12 @@ inline constexpr std::uint8_t kLogBlockId      = 0;
 inline constexpr std::uint8_t kLogPeriod10ms   = 5;   // 50 ms
 inline constexpr std::uint8_t kLogVarCount     = 7;
 
+// Slice 6's second log block — Multiranger ranges. Five uint16_t values
+// (front/back/left/right/up) in millimetres, 50 ms period.
+inline constexpr std::uint8_t kRangeBlockId    = 1;
+inline constexpr std::uint8_t kRangePeriod10ms = 5;   // 50 ms
+inline constexpr std::uint8_t kRangeVarCount   = 5;
+
 enum class LogSetupError : std::uint8_t {
     SendFailed,
     Timeout,
@@ -59,6 +65,16 @@ struct LogResolved {
     std::uint16_t roll_id{};
     std::uint16_t pitch_id{};
     std::uint16_t yaw_id{};
+};
+
+// Multiranger TOC indices (range block).
+struct RangeResolved {
+    std::uint16_t front_id{};
+    std::uint16_t back_id{};
+    std::uint16_t left_id{};
+    std::uint16_t right_id{};
+    std::uint16_t up_id{};
+    bool          available{false};   // false if multiranger deck absent
 };
 
 // Progress milestones emitted during setup. Lets main.cpp print structured
@@ -98,6 +114,18 @@ std::expected<SupervisorState, LogSetupFailure>
 query_supervisor_state(ICrazyflieLink& link,
                        std::function<void(const RawPacket&)> passthrough,
                        std::chrono::milliseconds timeout = std::chrono::milliseconds{500});
+
+// Optional bring-up for the multiranger range block. Walks the LOG TOC
+// for `range.{front,back,left,right,up}`, creates and starts block 1.
+// Returns RangeResolved with available=false (and no failure) if the
+// vars aren't in the TOC — i.e. no multiranger deck attached. Hard
+// failures (send error, ack mismatch on a block we know exists) still
+// surface as LogSetupFailure.
+std::expected<RangeResolved, LogSetupFailure>
+setup_range_block(ICrazyflieLink& link,
+                  std::function<void(const RawPacket&)> passthrough,
+                  LogSetupNotifier on_progress = nullptr,
+                  std::chrono::milliseconds total_timeout = std::chrono::seconds{5});
 
 // ---------------------------------------------------------------------------
 // LogBlockSample → Telemetry adapters. Pure functions; tested directly.

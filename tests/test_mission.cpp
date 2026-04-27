@@ -34,11 +34,14 @@ cfo::MissionConfig small_cfg() {
     cfo::MissionConfig c{};
     c.target_height_m = 0.30f;
     c.forward_velocity_mps = 0.15f;
+    c.forward_step_m = 0.10f;
+    c.forward_max_steps = 3;
+    c.forward_step_duration = 100ms;
     c.takeoff_duration = 100ms;
     c.hover_duration = 100ms;
-    c.forward_duration = 100ms;
     c.preland_hover_duration = 100ms;
     c.hlc_land_duration = 100ms;
+    c.obstacle_hold_duration = 100ms;
     c.abort_descent_dwell = 100ms;
     c.total_timeout = 10s;
     return c;
@@ -92,12 +95,12 @@ TEST_CASE("mission_tick: full happy-path progression") {
     REQUIRE(r.terminated);
     CHECK(r.final.state == cfo::MissionState::Completed);
     // Linear progression: Idle → TakingOff → HoverStabilizing →
-    // ForwardSegment → PreLandHover → HlcLanding → Completed.
+    // ForwardProgress → PreLandHover → HlcLanding → Completed.
     REQUIRE(r.states.size() == 7);
     CHECK(r.states[0] == cfo::MissionState::Idle);
     CHECK(r.states[1] == cfo::MissionState::TakingOff);
     CHECK(r.states[2] == cfo::MissionState::HoverStabilizing);
-    CHECK(r.states[3] == cfo::MissionState::ForwardSegment);
+    CHECK(r.states[3] == cfo::MissionState::ForwardProgress);
     CHECK(r.states[4] == cfo::MissionState::PreLandHover);
     CHECK(r.states[5] == cfo::MissionState::HlcLanding);
     CHECK(r.states[6] == cfo::MissionState::Completed);
@@ -143,11 +146,11 @@ TEST_CASE("mission_tick: TakingOff emits NoOp until takeoff_duration elapses") {
     }
 }
 
-TEST_CASE("mission_tick: HoverStabilizing -> ForwardSegment fires HlcGoTo with relative +x") {
+TEST_CASE("mission_tick: HoverStabilizing -> ForwardProgress fires first HlcGoTo step") {
     auto cfg = small_cfg();
     cfg.hover_duration = 100ms;
-    cfg.forward_velocity_mps = 0.20f;
-    cfg.forward_duration = 1500ms;     // 0.20 m/s * 1.5 s = 0.30 m forward
+    cfg.forward_step_m = 0.20f;
+    cfg.forward_step_duration = 1500ms;
     cfo::MissionContext ctx{};
     ctx.state = cfo::MissionState::HoverStabilizing;
     const auto t0 = clock::now();
@@ -159,38 +162,107 @@ TEST_CASE("mission_tick: HoverStabilizing -> ForwardSegment fires HlcGoTo with r
         CHECK(out.next.state == cfo::MissionState::HoverStabilizing);
         CHECK(out.command.kind == cfo::MissionCommand::Kind::NoOp);
     }
-    SUBCASE("at deadline: GO_TO with relative=true and duration matching config") {
+    SUBCASE("at deadline: GO_TO step_m forward, relative=true") {
         auto out = cfo::mission_tick(ctx, healthy_input(t0 + 100ms), cfg);
-        CHECK(out.next.state == cfo::MissionState::ForwardSegment);
+        CHECK(out.next.state == cfo::MissionState::ForwardProgress);
         CHECK(out.state_changed);
         CHECK(out.command.kind == cfo::MissionCommand::Kind::HlcGoTo);
-        CHECK(out.command.hlc_goto_x_m   == doctest::Approx(0.30f).epsilon(1e-4));
+        CHECK(out.command.hlc_goto_x_m   == doctest::Approx(0.20f));
         CHECK(out.command.hlc_goto_y_m   == 0.0f);
         CHECK(out.command.hlc_goto_z_m   == 0.0f);
         CHECK(out.command.hlc_goto_relative == true);
         CHECK(out.command.hlc_duration_s == doctest::Approx(1.5f));
+        CHECK(out.next.forward_steps_done == 1);
+    }
+    SUBCASE("at deadline with Blocked: skip ForwardProgress, go to ObstacleHold") {
+        auto in = healthy_input(t0 + 100ms);
+        in.forward_obstacle = cfo::ObstacleStatus::Blocked;
+        auto out = cfo::mission_tick(ctx, in, cfg);
+        CHECK(out.next.state == cfo::MissionState::ObstacleHold);
+        CHECK(out.command.kind == cfo::MissionCommand::Kind::NoOp);
     }
 }
 
-TEST_CASE("mission_tick: ForwardSegment NoOp + transition to PreLandHover") {
+TEST_CASE("mission_tick: ForwardProgress steps + obstacle gating") {
     auto cfg = small_cfg();
-    cfg.forward_duration = 100ms;
+    cfg.forward_step_m = 0.10f;
+    cfg.forward_step_duration = 100ms;
+    cfg.forward_max_steps = 3;
     cfo::MissionContext ctx{};
-    ctx.state = cfo::MissionState::ForwardSegment;
+    ctx.state = cfo::MissionState::ForwardProgress;
+    ctx.forward_steps_done = 1;        // first step already issued on entry
+    const auto t0 = clock::now();
+    ctx.state_entered = t0;
+    ctx.last_step_emit = t0;
+    ctx.mission_started = t0;
+
+    SUBCASE("mid-step, clear: NoOp (HLC GO_TO is executing)") {
+        auto out = cfo::mission_tick(ctx, healthy_input(t0 + 50ms), cfg);
+        CHECK(out.next.state == cfo::MissionState::ForwardProgress);
+        CHECK(out.command.kind == cfo::MissionCommand::Kind::NoOp);
+    }
+    SUBCASE("mid-step, Blocked: halt + transition to ObstacleHold immediately") {
+        // Blocked must preempt the in-flight step. The mission should
+        // emit a relative-zero GO_TO to settle the drone in place.
+        auto in = healthy_input(t0 + 50ms);
+        in.forward_obstacle = cfo::ObstacleStatus::Blocked;
+        auto out = cfo::mission_tick(ctx, in, cfg);
+        CHECK(out.next.state == cfo::MissionState::ObstacleHold);
+        CHECK(out.state_changed);
+        CHECK(out.command.kind == cfo::MissionCommand::Kind::HlcGoTo);
+        CHECK(out.command.hlc_goto_x_m == 0.0f);
+        CHECK(out.command.hlc_goto_y_m == 0.0f);
+        CHECK(out.command.hlc_goto_z_m == 0.0f);
+        CHECK(out.command.hlc_goto_relative == true);
+    }
+    SUBCASE("step boundary, clear: emit next step, increment counter") {
+        auto out = cfo::mission_tick(ctx, healthy_input(t0 + 100ms), cfg);
+        CHECK(out.next.state == cfo::MissionState::ForwardProgress);
+        CHECK(out.command.kind == cfo::MissionCommand::Kind::HlcGoTo);
+        CHECK(out.command.hlc_goto_x_m == doctest::Approx(0.10f));
+        CHECK(out.next.forward_steps_done == 2);
+    }
+    SUBCASE("step boundary, blocked: halt + transition to ObstacleHold") {
+        auto in = healthy_input(t0 + 100ms);
+        in.forward_obstacle = cfo::ObstacleStatus::Blocked;
+        auto out = cfo::mission_tick(ctx, in, cfg);
+        CHECK(out.next.state == cfo::MissionState::ObstacleHold);
+        CHECK(out.command.kind == cfo::MissionCommand::Kind::HlcGoTo);
+        CHECK(out.command.hlc_goto_x_m == 0.0f);
+    }
+    SUBCASE("step boundary at max_steps: transition to PreLandHover") {
+        ctx.forward_steps_done = cfg.forward_max_steps;   // already done
+        auto out = cfo::mission_tick(ctx, healthy_input(t0 + 100ms), cfg);
+        CHECK(out.next.state == cfo::MissionState::PreLandHover);
+        CHECK(out.command.kind == cfo::MissionCommand::Kind::NoOp);
+    }
+    SUBCASE("Caution does NOT block forward progress (v1 policy)") {
+        auto in = healthy_input(t0 + 100ms);
+        in.forward_obstacle = cfo::ObstacleStatus::Caution;
+        auto out = cfo::mission_tick(ctx, in, cfg);
+        CHECK(out.next.state == cfo::MissionState::ForwardProgress);
+        CHECK(out.command.kind == cfo::MissionCommand::Kind::HlcGoTo);
+    }
+}
+
+TEST_CASE("mission_tick: ObstacleHold holds, then transitions to PreLandHover") {
+    auto cfg = small_cfg();
+    cfg.obstacle_hold_duration = 100ms;
+    cfo::MissionContext ctx{};
+    ctx.state = cfo::MissionState::ObstacleHold;
     const auto t0 = clock::now();
     ctx.state_entered = t0;
     ctx.mission_started = t0;
 
-    SUBCASE("mid-forward: NoOp (HLC GO_TO is in flight)") {
+    SUBCASE("mid-hold: NoOp, no transition") {
         auto out = cfo::mission_tick(ctx, healthy_input(t0 + 50ms), cfg);
-        CHECK(out.next.state == cfo::MissionState::ForwardSegment);
+        CHECK(out.next.state == cfo::MissionState::ObstacleHold);
         CHECK(out.command.kind == cfo::MissionCommand::Kind::NoOp);
     }
-    SUBCASE("at deadline: transition to PreLandHover, still NoOp") {
+    SUBCASE("hold elapsed: transition to PreLandHover for graceful land") {
         auto out = cfo::mission_tick(ctx, healthy_input(t0 + 100ms), cfg);
         CHECK(out.next.state == cfo::MissionState::PreLandHover);
         CHECK(out.state_changed);
-        CHECK(out.command.kind == cfo::MissionCommand::Kind::NoOp);
     }
 }
 
@@ -272,7 +344,7 @@ TEST_CASE("mission_tick: operator shutdown mid-flight enters Aborted, fires HlcL
     auto cfg = small_cfg();
     cfg.abort_descent_dwell = 800ms;
     cfo::MissionContext ctx{};
-    ctx.state = cfo::MissionState::ForwardSegment;
+    ctx.state = cfo::MissionState::ForwardProgress;
     ctx.last_commanded_z = 0.30f;
     const auto t0 = clock::now();
     ctx.mission_started = t0;

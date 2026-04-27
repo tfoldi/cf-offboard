@@ -247,6 +247,135 @@ setup_log_block(ICrazyflieLink& link,
     return resolved;
 }
 
+std::expected<RangeResolved, LogSetupFailure>
+setup_range_block(ICrazyflieLink& link,
+                  std::function<void(const RawPacket&)> passthrough,
+                  LogSetupNotifier on_progress,
+                  std::chrono::milliseconds total_timeout) {
+    using namespace std::chrono_literals;
+    const auto deadline = clock::now() + total_timeout;
+
+    // Get TOC info first (same call as setup_log_block but on its own).
+    if (auto r = link.send(make_log_toc_info_v2_request()); !r) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::SendFailed, "send range toc_info_v2"});
+    }
+    auto info_pkt = wait_for(link, passthrough, deadline,
+                             "during range TOC info", is_toc_info_v2);
+    if (!info_pkt) return std::unexpected(info_pkt.error());
+    auto info = decode_log_toc_info_v2(*info_pkt);
+    if (!info) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::TocInfoFailed, "decode range toc_info_v2"});
+    }
+
+    RangeResolved resolved{};
+    std::array<WantedVar, kRangeVarCount> wants{{
+        {"range", "front", &resolved.front_id},
+        {"range", "back",  &resolved.back_id},
+        {"range", "left",  &resolved.left_id},
+        {"range", "right", &resolved.right_id},
+        {"range", "up",    &resolved.up_id},
+    }};
+    std::uint8_t found = 0;
+    for (std::uint16_t i = 0;
+         i < info->count && found < kRangeVarCount;
+         ++i) {
+        if (auto r = link.send(make_log_toc_item_v2_request(i)); !r) {
+            return std::unexpected(LogSetupFailure{
+                LogSetupError::SendFailed, "send range toc_item_v2"});
+        }
+        auto item_pkt = wait_for(link, passthrough, deadline,
+            std::string{"awaiting range toc_item_v2#"} + std::to_string(i),
+            [i](const RawPacket& p) { return is_toc_item_v2(p, i); });
+        if (!item_pkt) return std::unexpected(item_pkt.error());
+        auto item = decode_log_toc_item_v2(*item_pkt);
+        if (!item) {
+            return std::unexpected(LogSetupFailure{
+                LogSetupError::TocItemFailed,
+                "decode range toc_item_v2#" + std::to_string(i)});
+        }
+        for (auto& w : wants) {
+            if (w.slot && item->group == w.group && item->name == w.name) {
+                *w.slot = item->index;
+                w.slot = nullptr;
+                ++found;
+                LogSetupProgress p{};
+                p.phase = LogSetupProgress::Phase::VarResolved;
+                p.var_name = fqn(w.group, w.name);
+                p.resolved = found;
+                p.total = kRangeVarCount;
+                notify(on_progress, p);
+                break;
+            }
+        }
+    }
+    if (found < kRangeVarCount) {
+        // Multiranger deck not attached — soft fail. Caller continues
+        // without range data.
+        resolved.available = false;
+        return resolved;
+    }
+    resolved.available = true;
+
+    // CREATE_BLOCK_V2 for block 1.
+    constexpr std::uint8_t kU16 = crtp::log_type_byte(
+        crtp::kLogTypeUint16, crtp::kLogTypeUint16);
+    const std::array<LogVarSpec, kRangeVarCount> specs{{
+        {kU16, resolved.front_id},
+        {kU16, resolved.back_id},
+        {kU16, resolved.left_id},
+        {kU16, resolved.right_id},
+        {kU16, resolved.up_id},
+    }};
+    if (auto r = link.send(make_log_create_block_v2(kRangeBlockId, specs)); !r) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::SendFailed, "send range create_block"});
+    }
+    auto create_ack = wait_for(link, passthrough, deadline,
+        "awaiting range create_block ack",
+        [](const RawPacket& p) {
+            return is_settings_ack(p, crtp::kCmdLogCreateBlockV2);
+        });
+    if (!create_ack) return std::unexpected(create_ack.error());
+    auto ack = decode_log_settings_ack(*create_ack);
+    if (!ack) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::BlockCreateFailed, "malformed range create ack"});
+    }
+    if (ack->error_code != 0 && ack->error_code != EEXIST) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::BlockCreateFailed,
+            "range create error_code=" + std::to_string(ack->error_code)});
+    }
+    notify(on_progress, LogSetupProgress{LogSetupProgress::Phase::BlockCreated});
+
+    if (auto r = link.send(make_log_start_block(kRangeBlockId, kRangePeriod10ms)); !r) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::SendFailed, "send range start_logging"});
+    }
+    auto start_ack = wait_for(link, passthrough, deadline,
+        "awaiting range start ack",
+        [](const RawPacket& p) {
+            return is_settings_ack(p, crtp::kCmdLogStartLogging);
+        });
+    if (!start_ack) return std::unexpected(start_ack.error());
+    auto sack = decode_log_settings_ack(*start_ack);
+    if (!sack || sack->error_code != 0) {
+        return std::unexpected(LogSetupFailure{
+            LogSetupError::BlockStartFailed,
+            "range start error_code=" +
+                std::to_string(sack ? sack->error_code : 255)});
+    }
+    {
+        LogSetupProgress p{};
+        p.phase = LogSetupProgress::Phase::BlockStarted;
+        p.period_10ms = kRangePeriod10ms;
+        notify(on_progress, p);
+    }
+    return resolved;
+}
+
 std::expected<SupervisorState, LogSetupFailure>
 query_supervisor_state(ICrazyflieLink& link,
                        std::function<void(const RawPacket&)> passthrough,

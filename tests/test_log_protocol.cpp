@@ -398,6 +398,48 @@ TEST_CASE("is_param_write_ack: matches firmware echo on WRITE channel") {
     }
 }
 
+TEST_CASE("decode_range_block_sample: 14-byte payload, five uint16 LE ranges") {
+    cfo::RawPacket p{};
+    p.port = 5; p.channel = 2;
+    p.size = static_cast<std::uint8_t>(cfo::kRangeBlockPayloadSize);
+    p.payload[0] = 1;                  // block_id
+    put_u24(p, 1, 0x0ABCDE);
+    auto put_u16 = [&](std::size_t off, std::uint16_t v) {
+        p.payload[off]     = static_cast<std::uint8_t>(v & 0xFF);
+        p.payload[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+    };
+    put_u16(4,  800);    // front  0.80 m
+    put_u16(6,  1500);   // back   1.50 m
+    put_u16(8,  4000);   // left   4.00 m
+    put_u16(10, 50);     // right  0.05 m
+    put_u16(12, 8000);   // up     8.00 m
+
+    SUBCASE("happy path") {
+        auto r = cfo::decode_range_block_sample(p, /*expected=*/1);
+        REQUIRE(r);
+        CHECK(r->timestamp_ms == 0x0ABCDEu);
+        CHECK(r->front_mm == 800);
+        CHECK(r->back_mm  == 1500);
+        CHECK(r->left_mm  == 4000);
+        CHECK(r->right_mm == 50);
+        CHECK(r->up_mm    == 8000);
+    }
+    SUBCASE("wrong block_id rejected") {
+        CHECK(cfo::decode_range_block_sample(p, /*expected=*/0).error()
+              == cfo::DecodeError::WrongBlockId);
+    }
+    SUBCASE("undersized rejected") {
+        cfo::RawPacket q = p; q.size = 13;
+        CHECK(cfo::decode_range_block_sample(q, 1).error()
+              == cfo::DecodeError::WrongSize);
+    }
+    SUBCASE("wrong port/channel rejected") {
+        cfo::RawPacket q = p; q.channel = 1;
+        CHECK(cfo::decode_range_block_sample(q, 1).error()
+              == cfo::DecodeError::WrongPort);
+    }
+}
+
 TEST_CASE("decode_log_block_sample (slice 2's fixed layout)") {
     // Build a synthetic 30-byte log packet. Layout:
     //   block_id | timestamp_ms (24 LE) | x f32 | y f32 | z f32

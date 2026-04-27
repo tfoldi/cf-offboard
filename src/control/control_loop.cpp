@@ -72,6 +72,7 @@ to_event(const MissionCommand& c,
 
 void run_control_loop(ICrazyflieLink& link,
                       const StateStore& state,
+                      const AppStatusStore& app_status,
                       MCAPLogger& logger,
                       const ControlLoopConfig& cfg,
                       std::atomic<bool>& shutdown_requested,
@@ -96,6 +97,7 @@ void run_control_loop(ICrazyflieLink& link,
         in.now     = now;
         in.operator_shutdown =
             shutdown_requested.load(std::memory_order_acquire);
+        in.forward_obstacle = app_status.snapshot().obstacle_status;
 
         const auto out = mission_tick(ctx, in, cfg.mission);
         ctx = out.next;

@@ -152,6 +152,18 @@ target_include_directories(cfo_safety INTERFACE ${_cfo_src})
 target_link_libraries(cfo_safety INTERFACE cfo_state)
 
 # ----------------------------------------------------------------------------
+# Perception — multiranger ingestion, body-frame rays, odom projection,
+# and a rolling local-obstacle store. Pure functions where possible, tiny
+# mutex-protected buffer for the rolling store.
+# ----------------------------------------------------------------------------
+
+add_library(cfo_perception STATIC
+    src/perception/perception.cpp
+)
+target_include_directories(cfo_perception PUBLIC ${_cfo_src})
+target_link_libraries(cfo_perception PUBLIC cfo_state cfo_link)
+
+# ----------------------------------------------------------------------------
 # Mission state machine — pure tick function, no IO. Drives the control
 # loop's per-tick MissionCommand output.
 # ----------------------------------------------------------------------------
@@ -160,7 +172,7 @@ add_library(cfo_mission STATIC
     src/mission/mission.cpp
 )
 target_include_directories(cfo_mission PUBLIC ${_cfo_src})
-target_link_libraries(cfo_mission PUBLIC cfo_state cfo_safety)
+target_link_libraries(cfo_mission PUBLIC cfo_state cfo_safety cfo_perception)
 
 # ----------------------------------------------------------------------------
 # UI — hand-rolled ANSI terminal frontend. Observer of state, source of
@@ -215,7 +227,7 @@ target_link_libraries(cfo_control
 add_executable(cf-offboard src/app/main.cpp)
 target_link_libraries(cf-offboard PRIVATE
     cfo_link cfo_log cfo_param cfo_logging cfo_state
-    cfo_control cfo_safety cfo_mission cfo_ui
+    cfo_control cfo_safety cfo_mission cfo_perception cfo_ui
     Threads::Threads)
 
 # ----------------------------------------------------------------------------
@@ -249,9 +261,10 @@ add_executable(cfo_tests
     tests/test_safety.cpp
     tests/test_mission.cpp
     tests/test_manual_hlc.cpp
+    tests/test_perception.cpp
 )
 target_include_directories(cfo_tests PRIVATE ${_cfo_src})
 target_link_libraries(cfo_tests PRIVATE
-    cfo_link cfo_log cfo_state cfo_safety cfo_mission cfo_control cfo_ui
-    doctest_headers)
+    cfo_link cfo_log cfo_state cfo_safety cfo_mission cfo_perception
+    cfo_control cfo_ui doctest_headers)
 add_test(NAME cfo_tests COMMAND cfo_tests)

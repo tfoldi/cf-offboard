@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mission/types.hpp"
+#include "perception/types.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -72,6 +73,15 @@ struct AppStatus {
 
     // Manual sub-state (meaningful when mode == ManualHlc).
     ManualState manual_state{ManualState::OnGround};
+
+    // Perception (slice 6). `perception_active` is true once the
+    // multiranger range block has been brought up; the per-sensor
+    // values + validity reflect the most recent snapshot.
+    bool perception_active{false};
+    float front_m{}, back_m{}, left_m{}, right_m{}, up_m{};
+    bool  valid_front{}, valid_back{}, valid_left{}, valid_right{}, valid_up{};
+    ObstacleStatus obstacle_status{ObstacleStatus::Clear};
+    std::uint64_t range_update_count{0};
 
     std::string uri;
     std::string mcap_path;

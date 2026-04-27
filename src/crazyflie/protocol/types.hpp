@@ -178,6 +178,20 @@ struct LogBlockSample {
     float roll, pitch, yaw;      // stabilizer.{roll,pitch,yaw}  (float32)
 };
 
+// Multiranger range block (block_id = 1). Five uint16_t range readings in
+// millimetres. Layout on the wire:
+//   [block_id:1] [timestamp:3 LE] [front:u16] [back:u16] [left:u16]
+//                                 [right:u16] [up:u16]
+// Total payload: 1 + 3 + 5*2 = 14 bytes.
+struct RangeBlockSample {
+    std::uint32_t timestamp_ms;
+    std::uint16_t front_mm;
+    std::uint16_t back_mm;
+    std::uint16_t left_mm;
+    std::uint16_t right_mm;
+    std::uint16_t up_mm;
+};
+
 // Settings ack response (CREATE_BLOCK_V2, START_LOGGING, ...).
 struct LogSettingsAck {
     std::uint8_t cmd;

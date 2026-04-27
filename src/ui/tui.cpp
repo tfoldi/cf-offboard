@@ -316,6 +316,46 @@ void paint_vehicle(const VehicleState& v, int& row) {
                 kClearToEol.data());
 }
 
+// One row showing front/back/left/right/up + obstacle status. Greyed
+// out and labelled "no deck" when perception isn't active.
+void paint_perception(const AppStatus& s, int& row) {
+    cursor_to(row++, 1);
+    std::printf("%s-- perception --%s%s",
+                kBold.data(), kReset.data(), kClearToEol.data());
+
+    cursor_to(row++, 1);
+    if (!s.perception_active) {
+        std::printf("  %sno multiranger deck%s%s",
+                    kFgGray.data(), kReset.data(), kClearToEol.data());
+        return;
+    }
+
+    auto rng = [](float m, bool valid) -> std::string {
+        if (!valid) return "  --m";
+        char b[16];
+        std::snprintf(b, sizeof(b), "%5.2fm", m);
+        return std::string{b};
+    };
+
+    std::printf(
+        "  front:%s  back:%s  left:%s  right:%s  up:%s%s",
+        rng(s.front_m, s.valid_front).c_str(),
+        rng(s.back_m,  s.valid_back).c_str(),
+        rng(s.left_m,  s.valid_left).c_str(),
+        rng(s.right_m, s.valid_right).c_str(),
+        rng(s.up_m,    s.valid_up).c_str(),
+        kClearToEol.data());
+
+    cursor_to(row++, 1);
+    const char* color =
+        (s.obstacle_status == ObstacleStatus::Blocked) ? kFgRed.data()  :
+        (s.obstacle_status == ObstacleStatus::Caution) ? kFgYellow.data() :
+                                                          kFgGreen.data();
+    std::printf("  status:  %s%s%s%s",
+                color, obstacle_status_name(s.obstacle_status),
+                kReset.data(), kClearToEol.data());
+}
+
 void paint_events(const std::vector<LogEntry>& entries, int start_row,
                   int rows_available, int cols) {
     cursor_to(start_row, 1);
@@ -595,6 +635,9 @@ void run_tui(const StateStore& state,
         if (sz.cols >= 70) {
             paint_glyph(v, s, vehicle_top + 2, 60);
         }
+
+        ++row;  // blank separator
+        paint_perception(s, row);
 
         ++row;  // blank separator
         const int events_top = row;

@@ -4,8 +4,10 @@
 #include "crazyflie/link/interfaces.hpp"
 #include "logging/mcap_logger.hpp"
 #include "mission/types.hpp"
+#include "perception/types.hpp"
 #include "safety/types.hpp"
 #include "state/state_store.hpp"
+#include "ui/types.hpp"
 
 #include <atomic>
 #include <functional>
@@ -32,6 +34,7 @@ using MissionStateCallback =
 
 void run_control_loop(ICrazyflieLink& link,
                       const StateStore& state,
+                      const AppStatusStore& app_status,
                       MCAPLogger& logger,
                       const ControlLoopConfig& cfg,
                       std::atomic<bool>& shutdown_requested,

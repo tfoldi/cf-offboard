@@ -3,6 +3,7 @@
 #include "crazyflie/link/types.hpp"
 #include "crazyflie/protocol/types.hpp"
 #include "mission/types.hpp"
+#include "perception/types.hpp"
 #include "safety/types.hpp"
 
 #include <chrono>
@@ -93,6 +94,28 @@ struct MissionStateEvent {
     std::chrono::system_clock::time_point t;
 };
 
+// Decoded multiranger sample (5 ranges + validity).
+struct RangeBlockEvent {
+    RangeSnapshot snapshot;
+    std::chrono::system_clock::time_point t;
+};
+
+// One projected obstacle point in odom frame, derived from a fresh range
+// reading + fresh vehicle pose.
+struct ObstaclePointEvent {
+    ObstaclePoint point;
+    std::chrono::system_clock::time_point t;
+};
+
+// Forward-obstacle classification transition (Clear → Blocked, etc).
+// Emitted only when the classification changes, so the channel stays
+// readable on long runs.
+struct ObstacleStatusEvent {
+    ObstacleStatus status;
+    float front_m;
+    std::chrono::system_clock::time_point t;
+};
+
 // Closed set of events the logger knows how to write. Extended per slice
 // as new event categories are added.
 using LogEvent = std::variant<
@@ -104,6 +127,9 @@ using LogEvent = std::variant<
     SetpointCommandEvent,
     SafetyEvent,
     SupervisorStateEvent,
-    MissionStateEvent>;
+    MissionStateEvent,
+    RangeBlockEvent,
+    ObstaclePointEvent,
+    ObstacleStatusEvent>;
 
 } // namespace cfo

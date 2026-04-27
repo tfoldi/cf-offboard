@@ -633,6 +633,7 @@ make_hlc_go_to(float x, float y, float z, float yaw_rad, float duration_s,
 // ---------------------------------------------------------------------------
 
 inline constexpr std::size_t kLogBlockPayloadSize = 30;
+inline constexpr std::size_t kRangeBlockPayloadSize = 14;
 
 [[nodiscard]] inline std::expected<LogBlockSample, DecodeError>
 decode_log_block_sample(const RawPacket& pkt, std::uint8_t expected_block_id) {
@@ -671,6 +672,36 @@ decode_log_block_sample(const RawPacket& pkt, std::uint8_t expected_block_id) {
     s.roll  = read_f32(18);
     s.pitch = read_f32(22);
     s.yaw   = read_f32(26);
+    return s;
+}
+
+// Multiranger range block decoder.
+[[nodiscard]] inline std::expected<RangeBlockSample, DecodeError>
+decode_range_block_sample(const RawPacket& pkt, std::uint8_t expected_block_id) {
+    if (pkt.port != crtp::kPortLog ||
+        pkt.channel != crtp::kChannelLogData) {
+        return std::unexpected(DecodeError::WrongPort);
+    }
+    if (pkt.size != kRangeBlockPayloadSize) {
+        return std::unexpected(DecodeError::WrongSize);
+    }
+    if (pkt.payload[0] != expected_block_id) {
+        return std::unexpected(DecodeError::WrongBlockId);
+    }
+    RangeBlockSample s{};
+    s.timestamp_ms =
+        static_cast<std::uint32_t>(pkt.payload[1]) |
+        (static_cast<std::uint32_t>(pkt.payload[2]) << 8) |
+        (static_cast<std::uint32_t>(pkt.payload[3]) << 16);
+    auto read_u16 = [&](std::size_t off) -> std::uint16_t {
+        return static_cast<std::uint16_t>(
+            pkt.payload[off] | (pkt.payload[off + 1] << 8));
+    };
+    s.front_mm = read_u16(4);
+    s.back_mm  = read_u16(6);
+    s.left_mm  = read_u16(8);
+    s.right_mm = read_u16(10);
+    s.up_mm    = read_u16(12);
     return s;
 }
 

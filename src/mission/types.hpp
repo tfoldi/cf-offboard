@@ -1,5 +1,6 @@
 #pragma once
 
+#include "perception/types.hpp"
 #include "safety/types.hpp"
 #include "state/types.hpp"
 
@@ -19,11 +20,19 @@ namespace cfo {
 // dropped the last few cm because the flow deck can't track below ~3 cm
 // and setpoint_stop was disarming with the drone still airborne; HLC
 // LAND has firmware-side touchdown logic.
+// Linear progression for the obstacle-aware first mission:
+//   Idle → TakingOff → HoverStabilizing → ForwardProgress → PreLandHover
+//        → HlcLanding → Completed
+// ObstacleHold replaces the rest of ForwardProgress when the forward
+// path is blocked: short hover, then a graceful land.
+// Aborted is the failure branch entered from any non-terminal state on
+// safety / operator abort.
 enum class MissionState : std::uint8_t {
     Idle,
     TakingOff,
     HoverStabilizing,
-    ForwardSegment,
+    ForwardProgress,
+    ObstacleHold,
     PreLandHover,
     HlcLanding,
     Completed,
@@ -35,7 +44,8 @@ enum class MissionState : std::uint8_t {
         case MissionState::Idle:             return "Idle";
         case MissionState::TakingOff:        return "TakingOff";
         case MissionState::HoverStabilizing: return "HoverStabilizing";
-        case MissionState::ForwardSegment:   return "ForwardSegment";
+        case MissionState::ForwardProgress:  return "ForwardProgress";
+        case MissionState::ObstacleHold:     return "ObstacleHold";
         case MissionState::PreLandHover:     return "PreLandHover";
         case MissionState::HlcLanding:       return "HlcLanding";
         case MissionState::Completed:        return "Completed";
@@ -50,10 +60,20 @@ struct MissionConfig {
     float target_height_m{0.30f};
     float forward_velocity_mps{0.15f};
 
+    // ForwardProgress: the mission moves forward in `forward_max_steps`
+    // bounded HLC GO_TO segments of `forward_step_m` each. The obstacle
+    // gate is checked at every step boundary — Blocked transitions to
+    // ObstacleHold, Clear / Caution continue.
+    float        forward_step_m{0.20f};
+    std::uint8_t forward_max_steps{5};
+    std::chrono::milliseconds forward_step_duration{1500};
+
     std::chrono::milliseconds takeoff_duration{1500};
     std::chrono::milliseconds hover_duration{1500};
-    std::chrono::milliseconds forward_duration{1500};
     std::chrono::milliseconds preland_hover_duration{1000};
+
+    // Brief hover after Blocked is detected, then graceful land.
+    std::chrono::milliseconds obstacle_hold_duration{500};
 
     // HLC LAND parameters. The firmware-side high-level commander
     // executes the descent over `hlc_land_duration` and includes its own
@@ -121,6 +141,12 @@ struct MissionContext {
     // Last commanded altitude — used to start the abort descent ramp from
     // wherever we were, rather than yanking from any value to 0.
     float last_commanded_z{0.0f};
+
+    // ForwardProgress sub-state: number of GO_TO steps already issued and
+    // when the most recent one was emitted. The next step boundary is at
+    // last_step_emit + forward_step_duration.
+    std::uint8_t forward_steps_done{0};
+    std::chrono::steady_clock::time_point last_step_emit{};
 };
 
 // Inputs the supervisor and trajectory shaper need each tick.
@@ -129,6 +155,11 @@ struct MissionTickInput {
     SafetyDecision safety{};
     std::chrono::steady_clock::time_point now{};
     bool operator_shutdown{false};
+
+    // Latest forward-obstacle classification. Defaults to Clear so that
+    // missions running on a Crazyflie without a Multiranger deck behave
+    // identically to slice 5's first-flight mission.
+    ObstacleStatus forward_obstacle{ObstacleStatus::Clear};
 };
 
 struct MissionTickOutput {

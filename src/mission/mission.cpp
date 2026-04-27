@@ -160,29 +160,71 @@ MissionTickOutput mission_tick(const MissionContext& ctx,
         }
 
         case MissionState::HoverStabilizing: {
-            // HLC continues holding the position from TAKEOFF. We just
-            // wait the configured stabilizing window.
+            // HLC continues holding the position from TAKEOFF. Wait the
+            // stabilising window, then enter ForwardProgress and emit
+            // the first GO_TO — unless the path is already blocked, in
+            // which case skip forward entirely and go to ObstacleHold.
             if (elapsed_ge(s.state_entered, in.now, cfg.hover_duration)) {
-                out.next = enter(out.next, MissionState::ForwardSegment, in.now);
+                if (in.forward_obstacle == ObstacleStatus::Blocked) {
+                    out.next = enter(out.next, MissionState::ObstacleHold, in.now);
+                    out.state_changed = true;
+                    out.command = noop_cmd();
+                    return out;
+                }
+                out.next = enter(out.next, MissionState::ForwardProgress, in.now);
                 out.state_changed = true;
-                // Fire HLC GO_TO on entry to ForwardSegment. Forward
-                // distance = velocity × duration in the body's +x (relative).
-                const float fwd = cfg.forward_velocity_mps *
-                                  to_seconds(cfg.forward_duration);
                 out.command = hlc_goto_cmd(
-                    /*x=*/fwd, /*y=*/0.0f, /*z=*/0.0f, /*yaw=*/0.0f,
-                    to_seconds(cfg.forward_duration),
+                    cfg.forward_step_m, 0.0f, 0.0f, 0.0f,
+                    to_seconds(cfg.forward_step_duration),
                     /*relative=*/true);
+                out.next.last_step_emit = in.now;
+                out.next.forward_steps_done = 1;
             } else {
                 out.command = noop_cmd();
             }
             return out;
         }
 
-        case MissionState::ForwardSegment: {
-            // HLC GO_TO is executing. Wait it out; HLC will hold at the
-            // target position once the trajectory finishes.
-            if (elapsed_ge(s.state_entered, in.now, cfg.forward_duration)) {
+        case MissionState::ForwardProgress: {
+            // Continuous obstacle preempt. If the forward path becomes
+            // Blocked at *any* tick (not just at step boundaries),
+            // immediately halt the in-flight HLC GO_TO by issuing a
+            // relative-zero GO_TO — the firmware re-plans to the current
+            // position, decelerating the drone — then enter ObstacleHold.
+            if (in.forward_obstacle == ObstacleStatus::Blocked) {
+                out.next = enter(out.next, MissionState::ObstacleHold, in.now);
+                out.state_changed = true;
+                out.command = hlc_goto_cmd(
+                    0.0f, 0.0f, 0.0f, 0.0f,
+                    /*duration=*/0.3f, /*relative=*/true);
+                return out;
+            }
+            const auto since_step = in.now - s.last_step_emit;
+            if (since_step < cfg.forward_step_duration) {
+                out.command = noop_cmd();
+                return out;
+            }
+            // Step boundary, path Clear/Caution: either continue or end.
+            if (s.forward_steps_done >= cfg.forward_max_steps) {
+                out.next = enter(out.next, MissionState::PreLandHover, in.now);
+                out.state_changed = true;
+                out.command = noop_cmd();
+                return out;
+            }
+            out.command = hlc_goto_cmd(
+                cfg.forward_step_m, 0.0f, 0.0f, 0.0f,
+                to_seconds(cfg.forward_step_duration),
+                /*relative=*/true);
+            out.next.last_step_emit = in.now;
+            out.next.forward_steps_done = s.forward_steps_done + 1;
+            return out;
+        }
+
+        case MissionState::ObstacleHold: {
+            // Brief hover, then graceful land via PreLandHover →
+            // HlcLanding. HLC keeps holding the position from the last
+            // step, so we just NoOp and wait.
+            if (elapsed_ge(s.state_entered, in.now, cfg.obstacle_hold_duration)) {
                 out.next = enter(out.next, MissionState::PreLandHover, in.now);
                 out.state_changed = true;
             }
